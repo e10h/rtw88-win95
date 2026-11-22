@@ -48,6 +48,26 @@
 #define IOCTL_RTW_FW_INIT           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RTW_FW_WRITE_PAGE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RTW_FW_BOOT           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RTW_MAC_ENABLE        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RTW_BULK_RX           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RTW_BULK_TX           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define REG_CR                      0x0100
+#define REG_RCR                     0x0608
+#define REG_RXPKTNUM                0x02B0
+#define REG_RXDMA_MODE              0x0290
+
+typedef struct _RTW_RX_PACKET {
+    ULONG Status;
+    ULONG Length;
+    ULONG RxPktNum;
+    UCHAR Data[2048];
+} RTW_RX_PACKET, *PRTW_RX_PACKET;
+
+typedef struct _RTW_TX_PACKET {
+    ULONG Length;
+    UCHAR Data[2048];
+} RTW_TX_PACKET, *PRTW_TX_PACKET;
 
 typedef struct _RTW_PIPE_INFO {
     UCHAR EndpointAddress;
@@ -238,6 +258,59 @@ static NTSTATUS RTW_Write16(PDEVICE_OBJECT LowerDevice, USHORT addr, USHORT val)
 
 static NTSTATUS RTW_Write32(PDEVICE_OBJECT LowerDevice, USHORT addr, ULONG val) {
     return RTW_UsbWriteReg(LowerDevice, addr, &val, 4);
+}
+
+/* -------------------------------------------------------------
+   USB Bulk Transfer Engine (Pipe 0 = EP 84 IN, Pipe 2 = EP 06 OUT)
+------------------------------------------------------------- */
+static NTSTATUS RTW_UsbBulkTransfer(
+    PDEVICE_OBJECT LowerDevice,
+    USBD_PIPE_HANDLE PipeHandle,
+    ULONG TransferFlags,
+    PVOID Buffer,
+    ULONG BufferLength,
+    PULONG BytesTransferred
+) {
+    KEVENT event;
+    IO_STATUS_BLOCK ioStatus;
+    PIRP irp;
+    PIO_STACK_LOCATION nextStack;
+    struct _URB_BULK_OR_INTERRUPT_TRANSFER urb;
+    NTSTATUS status;
+
+    RtlZeroMemory(&urb, sizeof(urb));
+    urb.Hdr.Length = sizeof(urb);
+    urb.Hdr.Function = URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER;
+    urb.PipeHandle = PipeHandle;
+    urb.TransferFlags = TransferFlags;
+    urb.TransferBufferLength = BufferLength;
+    urb.TransferBuffer = Buffer;
+
+    KeInitializeEvent(&event, NotificationEvent, FALSE);
+
+    irp = IoBuildDeviceIoControlRequest(
+        IOCTL_INTERNAL_USB_SUBMIT_URB,
+        LowerDevice,
+        NULL, 0, NULL, 0,
+        TRUE, &event, &ioStatus
+    );
+
+    if (!irp) return STATUS_INSUFFICIENT_RESOURCES;
+
+    nextStack = IoGetNextIrpStackLocation(irp);
+    nextStack->Parameters.Others.Argument1 = &urb;
+
+    status = IoCallDriver(LowerDevice, irp);
+    if (status == STATUS_PENDING) {
+        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+        status = ioStatus.Status;
+    }
+
+    if (BytesTransferred) {
+        *BytesTransferred = urb.TransferBufferLength;
+    }
+
+    return status;
 }
 
 /* -------------------------------------------------------------
@@ -471,7 +544,8 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
             if (NT_SUCCESS(status)) {
                 pDevExt->DeviceStarted = TRUE;
-                DbgPrint("RTWPROBE: Start Device successful\n");
+                RTW_ConfigureDevice(pDevExt);
+                DbgPrint("RTWPROBE: Start Device successful, pipes configured\n");
             }
 
             Irp->IoStatus.Status = status;
@@ -488,57 +562,27 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             IoSkipCurrentIrpStackLocation(Irp);
             return IoCallDriver(pDevExt->LowerDeviceObject, Irp);
 
-        case 0x17: /* IRP_MN_SURPRISE_REMOVAL */ {
-            UNICODE_STRING symLink;
-            RtlInitUnicodeString(&symLink, L"\\DosDevices\\RTWPROBE");
-            IoDeleteSymbolicLink(&symLink);
-
-            if (pDevExt->LowerDeviceObject) {
-                *((PULONG)((PCHAR)pDevExt->LowerDeviceObject + 4)) = 0;
-                *((PULONG)((PCHAR)pDevExt->LowerDeviceObject + 16)) = 0;
-            }
-            if (pDevExt->PhysicalDeviceObject) {
-                *((PULONG)((PCHAR)pDevExt->PhysicalDeviceObject + 4)) = 0;
-                *((PULONG)((PCHAR)pDevExt->PhysicalDeviceObject + 16)) = 0;
-            }
-
-            /* Clear ReferenceCount (offset 4) and AttachedDevice (offset 16) to prevent NTKERN BugCheck 0x36 */
-            *((PULONG)((PCHAR)DeviceObject + 4)) = 0;
-            *((PULONG)((PCHAR)DeviceObject + 16)) = 0;
-
+        case 0x17: /* IRP_MN_SURPRISE_REMOVAL */
             Irp->IoStatus.Status = STATUS_SUCCESS;
             IoSkipCurrentIrpStackLocation(Irp);
             return IoCallDriver(pDevExt->LowerDeviceObject, Irp);
-        }
 
         case IRP_MN_REMOVE_DEVICE: {
-            PDEVICE_OBJECT lowerDev = pDevExt->LowerDeviceObject;
-            PDEVICE_OBJECT pdo = pDevExt->PhysicalDeviceObject;
             UNICODE_STRING symLink;
+            PDEVICE_OBJECT lowerDev = pDevExt->LowerDeviceObject;
             RtlInitUnicodeString(&symLink, L"\\DosDevices\\RTWPROBE");
             IoDeleteSymbolicLink(&symLink);
+            g_pDevExt = NULL;
+            pDevExt->LowerDeviceObject = NULL;
 
             if (lowerDev) {
                 IoDetachDevice(lowerDev);
-                *((PULONG)((PCHAR)lowerDev + 4)) = 0;
-                *((PULONG)((PCHAR)lowerDev + 16)) = 0;
             }
-
-            if (pdo && pdo != lowerDev) {
-                *((PULONG)((PCHAR)pdo + 4)) = 0;
-                *((PULONG)((PCHAR)pdo + 16)) = 0;
-            }
-
-            /* Clear ReferenceCount (offset 4) and AttachedDevice (offset 16) to prevent NTKERN BugCheck 0x36 */
-            *((PULONG)((PCHAR)DeviceObject + 4)) = 0;
-            *((PULONG)((PCHAR)DeviceObject + 16)) = 0;
 
             Irp->IoStatus.Status = STATUS_SUCCESS;
             IoSkipCurrentIrpStackLocation(Irp);
-            status = IoCallDriver(lowerDev, Irp);
-
-            IoDeleteDevice(DeviceObject);
-            return status;
+            /* Do NOT call IoDeleteDevice: NTKERN.VXD handles device cleanup; avoids BugCheck 0x36 completely */
+            return IoCallDriver(lowerDev, Irp);
         }
 
         default:
@@ -665,6 +709,93 @@ NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
                 info = sizeof(RTW_BOOT_RESULT);
                 status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+
+        case IOCTL_RTW_MAC_ENABLE: {
+            if (pDevExt->ConfigurationHandle == NULL) {
+                RTW_ConfigureDevice(pDevExt);
+            }
+
+            /* 1. Turn on MAC & HCI TX/RX DMA engines in REG_CR */
+            RTW_Write8(dev, REG_CR, 0xFF);
+
+            /* 2. Configure RCR: 0xE400220F (Accept Broadcast, Multicast, Unicast, Promiscuous) */
+            RTW_Write32(dev, REG_RCR, 0xE400220F);
+
+            /* 3. Configure RXDMA Mode (0x0290) */
+            RTW_Write8(dev, REG_RXDMA_MODE, 0x00);
+
+            if (stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(ULONG) * 3) {
+                PULONG out = (PULONG)Irp->AssociatedIrp.SystemBuffer;
+                out[0] = RTW_Read8(dev, REG_CR);
+                out[1] = RTW_Read32(dev, REG_RCR);
+                out[2] = RTW_Read16(dev, REG_RXPKTNUM);
+                info = sizeof(ULONG) * 3;
+            }
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        case IOCTL_RTW_BULK_RX: {
+            if (stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(RTW_RX_PACKET)) {
+                PRTW_RX_PACKET rxPkt = (PRTW_RX_PACKET)Irp->AssociatedIrp.SystemBuffer;
+                RtlZeroMemory(rxPkt, sizeof(RTW_RX_PACKET));
+
+                USHORT rxPktNum = RTW_Read16(dev, REG_RXPKTNUM);
+                rxPkt->RxPktNum = rxPktNum;
+
+                /* If no packets waiting in RX FIFO, return immediately (never hang on empty FIFO) */
+                if (rxPktNum == 0) {
+                    rxPkt->Length = 0;
+                    rxPkt->Status = STATUS_SUCCESS;
+                    info = sizeof(RTW_RX_PACKET);
+                    status = STATUS_SUCCESS;
+                    break;
+                }
+
+                if (pDevExt->NumberOfPipes > 0 && pDevExt->Pipes[0].PipeHandle) {
+                    ULONG bytesRead = 0;
+                    rxPkt->Status = RTW_UsbBulkTransfer(
+                        dev,
+                        pDevExt->Pipes[0].PipeHandle,
+                        USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK,
+                        rxPkt->Data,
+                        sizeof(rxPkt->Data),
+                        &bytesRead
+                    );
+                    rxPkt->Length = bytesRead;
+                    info = sizeof(RTW_RX_PACKET);
+                    status = STATUS_SUCCESS;
+                } else {
+                    status = STATUS_DEVICE_NOT_READY;
+                }
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+
+        case IOCTL_RTW_BULK_TX: {
+            if (stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(RTW_TX_PACKET)) {
+                PRTW_TX_PACKET txPkt = (PRTW_TX_PACKET)Irp->AssociatedIrp.SystemBuffer;
+                if (pDevExt->NumberOfPipes > 2 && pDevExt->Pipes[2].PipeHandle) {
+                    ULONG bytesWritten = 0;
+                    status = RTW_UsbBulkTransfer(
+                        dev,
+                        pDevExt->Pipes[2].PipeHandle,
+                        0,
+                        txPkt->Data,
+                        txPkt->Length,
+                        &bytesWritten
+                    );
+                    info = bytesWritten;
+                } else {
+                    status = STATUS_DEVICE_NOT_READY;
+                }
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
             }
