@@ -544,8 +544,7 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
             if (NT_SUCCESS(status)) {
                 pDevExt->DeviceStarted = TRUE;
-                RTW_ConfigureDevice(pDevExt);
-                DbgPrint("RTWPROBE: Start Device successful, pipes configured\n");
+                DbgPrint("RTWPROBE: Start Device successful\n");
             }
 
             Irp->IoStatus.Status = status;
@@ -562,10 +561,17 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             IoSkipCurrentIrpStackLocation(Irp);
             return IoCallDriver(pDevExt->LowerDeviceObject, Irp);
 
-        case 0x17: /* IRP_MN_SURPRISE_REMOVAL */
+        case 0x17: /* IRP_MN_SURPRISE_REMOVAL */ {
+            UNICODE_STRING symLink;
+            RtlInitUnicodeString(&symLink, L"\\DosDevices\\RTWPROBE");
+            IoDeleteSymbolicLink(&symLink);
+
+            DeviceObject->ReferenceCount = 0;
+
             Irp->IoStatus.Status = STATUS_SUCCESS;
             IoSkipCurrentIrpStackLocation(Irp);
             return IoCallDriver(pDevExt->LowerDeviceObject, Irp);
+        }
 
         case IRP_MN_REMOVE_DEVICE: {
             UNICODE_STRING symLink;
@@ -578,6 +584,8 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             if (lowerDev) {
                 IoDetachDevice(lowerDev);
             }
+
+            DeviceObject->ReferenceCount = 0;
 
             Irp->IoStatus.Status = STATUS_SUCCESS;
             IoSkipCurrentIrpStackLocation(Irp);

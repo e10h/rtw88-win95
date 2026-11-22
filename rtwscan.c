@@ -1,40 +1,11 @@
 #include <windows.h>
 
-#define IOCTL_RTW_PROBE             CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RTW_FW_INIT           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RTW_FW_WRITE_PAGE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RTW_FW_BOOT           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RTW_MAC_ENABLE        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RTW_BULK_RX           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RTW_BULK_TX           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-typedef struct _RTW_PIPE_INFO {
-    unsigned char EndpointAddress;
-    unsigned char PipeType;
-    unsigned short MaxPacketSize;
-} RTW_PIPE_INFO;
-
-typedef struct _RTW_PROBE_DATA {
-    unsigned short func_en;
-    unsigned short clk_ctrl;
-    unsigned long sys_cfg;
-    long status_func;
-    long status_clk;
-    long status_cfg;
-    unsigned char reg_mac_0610[6];
-    unsigned char reg_mac_0050[6];
-    long status_mac_0610;
-    long status_mac_0050;
-
-    unsigned short mcufw_ctrl_init;
-    unsigned short mcufw_ctrl_dl_en;
-    unsigned long num_pipes;
-    RTW_PIPE_INFO pipes[8];
-    long status_select_config;
-    unsigned char platform_reset_ok;
-    unsigned char reserved[1];
-    unsigned short mcufw_ctrl_post_reset;
-} RTW_PROBE_DATA;
 
 typedef struct _RTW_FW_PAGE_PARAM {
     unsigned long PageIndex;
@@ -65,7 +36,6 @@ typedef struct _WIFI_NETWORK {
     unsigned char Channel;
 } WIFI_NETWORK;
 
-static RTW_PROBE_DATA g_ProbeData;
 static RTW_FW_PAGE_PARAM g_PageParam;
 static RTW_BOOT_RESULT g_BootRes;
 static RTW_RX_PACKET g_RxPkt;
@@ -223,6 +193,68 @@ static void Parse80211Frame(const unsigned char *pkt, unsigned long len) {
     }
 }
 
+static void UploadFirmware(HANDLE hDev) {
+    char numBuf[16];
+    char hexBuf[24];
+    DWORD bytesReturned = 0;
+
+    Print("[*] Checking for rtw8822b_fw.bin... ");
+    HANDLE hFw = CreateFileA("rtw8822b_fw.bin", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFw == INVALID_HANDLE_VALUE) {
+        Print("[NOT FOUND]\r\n(Please ensure rtw8822b_fw.bin is in the current directory)\r\n");
+        return;
+    }
+
+    DWORD fwSize = GetFileSize(hFw, NULL);
+    Print("Found (");
+    ToDec(numBuf, fwSize);
+    Print(numBuf);
+    Print(" bytes)\r\n");
+
+    Print("[*] Initializing MCU Download Mode... ");
+    unsigned short dlVal = 0;
+    DeviceIoControl(hDev, IOCTL_RTW_FW_INIT, NULL, 0, &dlVal, sizeof(dlVal), &bytesReturned, NULL);
+    ToHex16(hexBuf, dlVal);
+    Print(hexBuf);
+    Print((dlVal & 1) ? " [OK]\r\n" : " [FAIL]\r\n");
+
+    Print("[*] Streaming Firmware Pages... ");
+    DWORD bytesRead = 0;
+    unsigned long pageIdx = 0;
+    BOOL streamOk = TRUE;
+    SetFilePointer(hFw, 64, NULL, FILE_BEGIN); /* Skip 64-byte header */
+
+    while (1) {
+        ReadFile(hFw, g_PageParam.Data, 4096, &bytesRead, NULL);
+        if (bytesRead == 0) break;
+
+        g_PageParam.PageIndex = pageIdx;
+        g_PageParam.TargetAddr = 0x1000;
+        g_PageParam.Length = bytesRead;
+
+        BOOL pgOk = DeviceIoControl(hDev, IOCTL_RTW_FW_WRITE_PAGE, &g_PageParam, sizeof(g_PageParam), NULL, 0, &bytesReturned, NULL);
+        if (!pgOk) { streamOk = FALSE; break; }
+        pageIdx++;
+    }
+    CloseHandle(hFw);
+
+    ToDec(numBuf, pageIdx);
+    Print(numBuf);
+    Print(" pages streamed ");
+    Print(streamOk ? "[OK]\r\n" : "[FAIL]\r\n");
+
+    Print("[*] Booting 32-bit RISC CPU... ");
+    DeviceIoControl(hDev, IOCTL_RTW_FW_BOOT, NULL, 0, &g_BootRes, sizeof(g_BootRes), &bytesReturned, NULL);
+    ToHex16(hexBuf, g_BootRes.FinalMcuFwCtrl);
+    Print("REG_MCUFW_CTRL = ");
+    Print(hexBuf);
+    if ((g_BootRes.FinalMcuFwCtrl & 0x8000) || ((g_BootRes.FinalMcuFwCtrl & 0xC078) == 0xC078)) {
+        Print(" [FW_READY OK]\r\n");
+    } else {
+        Print(" [BOOT TIMEOUT]\r\n");
+    }
+}
+
 void mainCRTStartup(void) {
     char numBuf[16];
     char hexBuf[24];
@@ -260,97 +292,21 @@ void mainCRTStartup(void) {
     }
     Print("[OK]\r\n");
 
-    /* Step 1: Probe hardware state */
-    Print("[*] Checking device state... ");
-    BOOL probeOk = DeviceIoControl(hDev, IOCTL_RTW_PROBE, NULL, 0, &g_ProbeData, sizeof(g_ProbeData), &bytesReturned, NULL);
-    if (!probeOk) {
-        Print("[WARN: Probe IOCTL failed]\r\n");
-    } else {
-        Print("[OK]\r\n");
-        Print("    - Hardware Pipes Discovered: ");
-        ToDec(numBuf, g_ProbeData.num_pipes);
-        Print(numBuf);
-        Print("\r\n");
-    }
-
-    /* Step 2: Ensure Firmware is Loaded */
-    BOOL fwNeeded = TRUE;
-    if (probeOk && ((g_ProbeData.mcufw_ctrl_post_reset & 0x8000) || ((g_ProbeData.mcufw_ctrl_post_reset & 0xC078) == 0xC078))) {
-        Print("[*] 32-bit RISC CPU Firmware already active: REG_MCUFW_CTRL = ");
-        ToHex16(hexBuf, g_ProbeData.mcufw_ctrl_post_reset);
-        Print(hexBuf);
-        Print(" [OK]\r\n");
-        fwNeeded = FALSE;
-    }
-
-    if (fwNeeded) {
-        Print("[*] Checking for rtw8822b_fw.bin... ");
-        HANDLE hFw = CreateFileA("rtw8822b_fw.bin", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        if (hFw != INVALID_HANDLE_VALUE) {
-            DWORD fwSize = GetFileSize(hFw, NULL);
-            Print("Found (");
-            ToDec(numBuf, fwSize);
-            Print(numBuf);
-            Print(" bytes)\r\n");
-
-            Print("[*] Initializing MCU Download Mode... ");
-            unsigned short dlVal = 0;
-            DeviceIoControl(hDev, IOCTL_RTW_FW_INIT, NULL, 0, &dlVal, sizeof(dlVal), &bytesReturned, NULL);
-            ToHex16(hexBuf, dlVal);
-            Print(hexBuf);
-            Print((dlVal & 1) ? " [OK]\r\n" : " [FAIL]\r\n");
-
-            Print("[*] Streaming Firmware Pages... ");
-            DWORD bytesRead = 0;
-            unsigned long pageIdx = 0;
-            BOOL streamOk = TRUE;
-            SetFilePointer(hFw, 64, NULL, FILE_BEGIN); /* Skip 64-byte header */
-
-            while (1) {
-                ReadFile(hFw, g_PageParam.Data, 4096, &bytesRead, NULL);
-                if (bytesRead == 0) break;
-
-                g_PageParam.PageIndex = pageIdx;
-                g_PageParam.TargetAddr = 0x1000;
-                g_PageParam.Length = bytesRead;
-
-                BOOL pgOk = DeviceIoControl(hDev, IOCTL_RTW_FW_WRITE_PAGE, &g_PageParam, sizeof(g_PageParam), NULL, 0, &bytesReturned, NULL);
-                if (!pgOk) { streamOk = FALSE; break; }
-                pageIdx++;
-            }
-            CloseHandle(hFw);
-
-            ToDec(numBuf, pageIdx);
-            Print(numBuf);
-            Print(" pages streamed ");
-            Print(streamOk ? "[OK]\r\n" : "[FAIL]\r\n");
-
-            Print("[*] Booting 32-bit RISC CPU... ");
-            DeviceIoControl(hDev, IOCTL_RTW_FW_BOOT, NULL, 0, &g_BootRes, sizeof(g_BootRes), &bytesReturned, NULL);
-            ToHex16(hexBuf, g_BootRes.FinalMcuFwCtrl);
-            Print("REG_MCUFW_CTRL = ");
-            Print(hexBuf);
-            if ((g_BootRes.FinalMcuFwCtrl & 0x8000) || ((g_BootRes.FinalMcuFwCtrl & 0xC078) == 0xC078)) {
-                Print(" [FW_READY OK]\r\n");
-                FormatMac(macBuf, g_BootRes.PostBootMac);
-                Print("    - Factory Burned-in MAC: ");
-                Print(macBuf);
-                Print("\r\n");
-            } else {
-                Print(" [BOOT TIMEOUT]\r\n");
-            }
-        } else {
-            Print("[NOT FOUND]\r\n(Proceeding with existing chip state)\r\n");
-        }
-    }
-
-    /* Step 3: Activate MAC and RX engines */
+    /* Step 1: Activate MAC and RX engines */
     Print("[*] Activating MAC & RX Engines (REG_CR=0xFF, REG_RCR=0xE400220F)... ");
     unsigned long macStatus[3] = {0, 0, 0};
-    if (DeviceIoControl(hDev, IOCTL_RTW_MAC_ENABLE, NULL, 0, macStatus, sizeof(macStatus), &bytesReturned, NULL)) {
+    BOOL macOk = DeviceIoControl(hDev, IOCTL_RTW_MAC_ENABLE, NULL, 0, macStatus, sizeof(macStatus), &bytesReturned, NULL);
+
+    /* If CR is 0, firmware might need to be uploaded */
+    if (!macOk || (macStatus[0] == 0)) {
+        Print("[NEEDS FW]\r\n");
+        UploadFirmware(hDev);
+
+        Print("[*] Re-activating MAC & RX Engines... ");
+        DeviceIoControl(hDev, IOCTL_RTW_MAC_ENABLE, NULL, 0, macStatus, sizeof(macStatus), &bytesReturned, NULL);
         Print("[OK]\r\n");
     } else {
-        Print("[FAIL]\r\n");
+        Print("[OK]\r\n");
     }
 
     Print("    - REG_CR:  ");
@@ -364,7 +320,7 @@ void mainCRTStartup(void) {
     Print(numBuf);
     Print(" packets\r\n\r\n");
 
-    /* Step 4: Scan for Wi-Fi Beacons */
+    /* Step 2: Scan for Wi-Fi Beacons */
     Print("[*] Scanning for 802.11 beacons (20 passes)...\r\n");
     g_NetworkCount = 0;
     int totalPacketsHeard = 0;
@@ -403,9 +359,10 @@ void mainCRTStartup(void) {
         Sleep(100);
     }
 
+    /* IMMEDIATELY close handle so driver is never locked */
     CloseHandle(hDev);
 
-    /* Step 5: Report Results */
+    /* Step 3: Report Results */
     Print("\r\n------------------------------------------------------\r\n");
     Print(" Scan Results:\r\n");
     Print("------------------------------------------------------\r\n");
