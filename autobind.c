@@ -34,7 +34,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
 
     const char *targetClass = isNetMode ? "Net" : "USB";
     const char *driverName = isNetMode ? "RTW88.SYS" : "RTWPROBE.SYS";
-    const char *devLoader = isNetMode ? "*ndis,*ntkern" : "*ntkern";
+    const char *devLoader = "*ntkern";
     const char *driverDesc = isNetMode
         ? "Realtek RTL8822BU Wireless LAN 802.11ac Adapter"
         : "Realtek 8822BU USB Wi-Fi Probe Driver";
