@@ -1,0 +1,70 @@
+; RTW88.INF - NDIS 3.1 Network Miniport Driver Installation for Windows 95
+; Realtek RTL8822BU Wireless LAN 802.11ac Adapter (USB\VID_0BDA&PID_B812)
+
+[Version]
+Signature="$CHICAGO$"
+Class=Net
+ClassGUID={4d36e972-e325-11ce-bfc1-08002be10318}
+Provider=%Realtek%
+
+[Manufacturer]
+%Realtek%=Realtek
+
+[ControlFlags]
+
+[Realtek]
+%RTW88.DeviceDesc%=RTW88.ndi, USB\VID_0BDA&PID_B812
+
+;-------------------------------------------------------------------------
+; Realtek RTL8822BU NDIS Miniport Node
+;-------------------------------------------------------------------------
+[RTW88.ndi]
+AddReg=RTW88.ndi.reg
+DeviceID=USB\VID_0BDA&PID_B812
+
+[RTW88.ndi.reg]
+HKR,,DevLoader,,*ndis
+HKR,,DeviceVxDs,,RTW88.SYS
+HKR,,EnumPropPages,,"netdi.dll,EnumPropPages"
+
+; NDIS Specifics
+HKR,NDIS,LogDriverName,,"RTW88"
+HKR,NDIS,MajorNdisVersion,1,03
+HKR,NDIS,MinorNdisVersion,1,0A
+
+; Interfaces (Binds to VTCP.386 as standard Ethernet)
+HKR,Ndi\Interfaces,DefUpper,,"ndis3"
+HKR,Ndi\Interfaces,DefLower,,"ethernet"
+HKR,Ndi\Interfaces,UpperRange,,"ndis3"
+HKR,Ndi\Interfaces,LowerRange,,"ethernet"
+
+; Install sections
+HKR,Ndi\Install,,,RTW88.Install
+
+; Context & Device Identification
+HKR,Ndi,DeviceID,,"USB\VID_0BDA&PID_B812"
+HKR,Ndi,CardType,,"PNP"
+
+[RTW88.Install]
+CopyFiles=RTW88.CopyFiles
+
+[RTW88.CopyFiles]
+RTW88.SYS
+
+[SourceDisksNames]
+1=%DiskName%,,0
+
+[SourceDisksFiles]
+RTW88.SYS=1
+
+[DestinationDirs]
+DefaultDestDir=11             ; LDID_SYS (C:\WINDOWS\SYSTEM)
+RTW88.CopyFiles=11
+
+;-------------------------------------------------------------------------
+; Strings
+;-------------------------------------------------------------------------
+[Strings]
+Realtek="Realtek Semiconductor Corp."
+RTW88.DeviceDesc="Realtek RTL8822BU Wireless LAN 802.11ac Adapter"
+DiskName="Realtek RTL8822BU Windows 95 Installation Disk"

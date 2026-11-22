@@ -15,18 +15,53 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     char msg[1024];
     msg[0] = '\0';
 
-    StrCat(msg, "=== Realtek 8822BU Windows 95 Auto-Binder ===\n\n");
+    int choice = MessageBoxA(
+        NULL,
+        "=== Realtek RTL8822BU Windows 95 Auto-Binder ===\n\n"
+        "Choose Driver Mode:\n\n"
+        "[Yes]    = Bind RTW88.SYS (NDIS 3.1 Network Miniport for TCP/IP)\n"
+        "[No]     = Bind RTWPROBE.SYS (WDM Diagnostics & RTWSCAN)\n"
+        "[Cancel] = Exit without changes",
+        "Select Driver Mode",
+        MB_YESNOCANCEL | MB_ICONQUESTION
+    );
 
-    /* 1. Find or create a safe Services\Class\USB subkey */
-    HKEY hClassUsb;
+    if (choice == IDCANCEL) {
+        ExitProcess(0);
+    }
+
+    BOOL isNetMode = (choice == IDYES);
+
+    const char *targetClass = isNetMode ? "Net" : "USB";
+    const char *driverName = isNetMode ? "RTW88.SYS" : "RTWPROBE.SYS";
+    const char *devLoader = isNetMode ? "*ndis" : "*ntkern";
+    const char *driverDesc = isNetMode
+        ? "Realtek RTL8822BU Wireless LAN 802.11ac Adapter"
+        : "Realtek 8822BU USB Wi-Fi Probe Driver";
+    const char *clsGuid = isNetMode
+        ? "{4d36e972-e325-11ce-bfc1-08002be10318}"
+        : "{36fc9e60-c465-11cf-8056-444553540000}";
+    const char *matchId = "USB\\VID_0BDA&PID_B812";
+
+    StrCat(msg, isNetMode
+        ? "=== Binding NDIS 3.1 Miniport Driver (RTW88.SYS) ===\n\n"
+        : "=== Binding WDM Diagnostic Driver (RTWPROBE.SYS) ===\n\n");
+
+    /* 1. Open Services\Class\<targetClass> */
+    char classRegPath[128];
+    classRegPath[0] = '\0';
+    StrCat(classRegPath, "System\\CurrentControlSet\\Services\\Class\\");
+    StrCat(classRegPath, targetClass);
+
+    HKEY hClassKey;
     LONG res = RegOpenKeyExA(
         HKEY_LOCAL_MACHINE,
-        "System\\CurrentControlSet\\Services\\Class\\USB",
-        0, KEY_READ | KEY_WRITE, &hClassUsb
+        classRegPath,
+        0, KEY_READ | KEY_WRITE, &hClassKey
     );
 
     if (res != ERROR_SUCCESS) {
-        MessageBoxA(NULL, "Failed to open Services\\Class\\USB!", "Auto-Binder Error", MB_ICONERROR);
+        MessageBoxA(NULL, "Failed to open Services\\Class registry key!", "Auto-Binder Error", MB_ICONERROR);
         ExitProcess(1);
     }
 
@@ -35,7 +70,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     char chosenClassPath[32];
     chosenClassPath[0] = '\0';
 
-    /* Look for an index from 0005 upwards so we never conflict with 0000/0001 (NEC & Hub) */
+    /* Find an available index starting from 0005 upwards */
     HKEY hTargetClass = NULL;
     for (int i = 5; i <= 9; i++) {
         char subName[8];
@@ -47,37 +82,63 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
 
         DWORD disp = 0;
         res = RegCreateKeyExA(
-            hClassUsb, subName, 0, NULL,
+            hClassKey, subName, 0, NULL,
             REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL,
             &hTargetClass, &disp
         );
 
         if (res == ERROR_SUCCESS) {
             StrCpy(chosenClass, subName);
-            StrCpy(chosenClassPath, "USB\\");
+            StrCpy(chosenClassPath, targetClass);
+            StrCat(chosenClassPath, "\\");
             StrCat(chosenClassPath, subName);
             break;
         }
     }
 
     if (!hTargetClass) {
-        RegCloseKey(hClassUsb);
-        MessageBoxA(NULL, "Failed to create Services\\Class\\USB target key!", "Auto-Binder Error", MB_ICONERROR);
+        RegCloseKey(hClassKey);
+        MessageBoxA(NULL, "Failed to create Services\\Class target key!", "Auto-Binder Error", MB_ICONERROR);
         ExitProcess(2);
     }
 
-    /* Populate the Class\USB key */
-    const char *devLoader = "*ntkern";
-    const char *driverName = "RTWPROBE.SYS";
-    const char *driverDesc = "Realtek 8822BU USB Wi-Fi Probe Driver";
-    const char *matchId = "USB\\VID_0BDA&PID_B812";
-
+    /* Populate the Class key */
     RegSetValueExA(hTargetClass, "DevLoader", 0, REG_SZ, (const BYTE *)devLoader, lstrlenA(devLoader) + 1);
-    RegSetValueExA(hTargetClass, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
     RegSetValueExA(hTargetClass, "DriverDesc", 0, REG_SZ, (const BYTE *)driverDesc, lstrlenA(driverDesc) + 1);
     RegSetValueExA(hTargetClass, "MatchingDeviceId", 0, REG_SZ, (const BYTE *)matchId, lstrlenA(matchId) + 1);
+
+    if (isNetMode) {
+        RegSetValueExA(hTargetClass, "DeviceVxDs", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
+
+        /* NDIS Specific Subkeys */
+        HKEY hNdis;
+        if (RegCreateKeyExA(hTargetClass, "NDIS", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hNdis, NULL) == ERROR_SUCCESS) {
+            const char *logName = "RTW88";
+            BYTE majorVer = 3;
+            BYTE minorVer = 10;
+            RegSetValueExA(hNdis, "LogDriverName", 0, REG_SZ, (const BYTE *)logName, lstrlenA(logName) + 1);
+            RegSetValueExA(hNdis, "MajorNdisVersion", 0, REG_BINARY, &majorVer, 1);
+            RegSetValueExA(hNdis, "MinorNdisVersion", 0, REG_BINARY, &minorVer, 1);
+            RegCloseKey(hNdis);
+        }
+
+        /* Ndi\Interfaces Subkeys */
+        HKEY hNdiIf;
+        if (RegCreateKeyExA(hTargetClass, "Ndi\\Interfaces", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hNdiIf, NULL) == ERROR_SUCCESS) {
+            const char *defUpper = "ndis3";
+            const char *defLower = "ethernet";
+            RegSetValueExA(hNdiIf, "DefUpper", 0, REG_SZ, (const BYTE *)defUpper, lstrlenA(defUpper) + 1);
+            RegSetValueExA(hNdiIf, "DefLower", 0, REG_SZ, (const BYTE *)defLower, lstrlenA(defLower) + 1);
+            RegSetValueExA(hNdiIf, "UpperRange", 0, REG_SZ, (const BYTE *)defUpper, lstrlenA(defUpper) + 1);
+            RegSetValueExA(hNdiIf, "LowerRange", 0, REG_SZ, (const BYTE *)defLower, lstrlenA(defLower) + 1);
+            RegCloseKey(hNdiIf);
+        }
+    } else {
+        RegSetValueExA(hTargetClass, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
+    }
+
     RegCloseKey(hTargetClass);
-    RegCloseKey(hClassUsb);
+    RegCloseKey(hClassKey);
 
     StrCat(msg, "1. Configured Driver Class: ");
     StrCat(msg, chosenClassPath);
@@ -110,16 +171,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
         HKEY hInstKey;
         res = RegOpenKeyExA(hEnumVid, instName, 0, KEY_ALL_ACCESS, &hInstKey);
         if (res == ERROR_SUCCESS) {
-            const char *cls = "USB";
-            const char *clsGuid = "{36fc9e60-c465-11cf-8056-444553540000}";
             DWORD cfgFlags = 0;
 
-            RegSetValueExA(hInstKey, "Class", 0, REG_SZ, (const BYTE *)cls, lstrlenA(cls) + 1);
+            RegSetValueExA(hInstKey, "Class", 0, REG_SZ, (const BYTE *)targetClass, lstrlenA(targetClass) + 1);
             RegSetValueExA(hInstKey, "ClassGUID", 0, REG_SZ, (const BYTE *)clsGuid, lstrlenA(clsGuid) + 1);
             RegSetValueExA(hInstKey, "DeviceDesc", 0, REG_SZ, (const BYTE *)driverDesc, lstrlenA(driverDesc) + 1);
             RegSetValueExA(hInstKey, "Driver", 0, REG_SZ, (const BYTE *)chosenClassPath, lstrlenA(chosenClassPath) + 1);
             RegSetValueExA(hInstKey, "DevLoader", 0, REG_SZ, (const BYTE *)devLoader, lstrlenA(devLoader) + 1);
-            RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
+            if (isNetMode) {
+                RegSetValueExA(hInstKey, "DeviceVxDs", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
+            } else {
+                RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
+            }
             RegSetValueExA(hInstKey, "ConfigFlags", 0, REG_BINARY, (const BYTE *)&cfgFlags, 4);
 
             RegCloseKey(hInstKey);
@@ -141,12 +204,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
         ExitProcess(4);
     }
 
-    StrCat(msg, "\nSUCCESS! Registry is now bound to RTWPROBE.SYS!\n\n"
+    StrCat(msg, "\nSUCCESS! Registry is now bound to ");
+    StrCat(msg, driverName);
+    StrCat(msg, "!\n\n"
                 "Next Step:\n"
-                "1. Go to Device Manager and click 'Refresh' (or unplug/replug the Wi-Fi dongle).\n"
-                "2. Run RTWTEST.EXE!");
+                "1. Go to Device Manager and click 'Refresh' (or unplug/replug the Wi-Fi dongle).\n");
+    if (isNetMode) {
+        StrCat(msg, "2. Open Network Control Panel or Command Prompt to test TCP/IP (e.g. winipcfg or ping)!");
+    } else {
+        StrCat(msg, "2. Run RTWTEST.EXE or RTWSCAN.EXE!");
+    }
 
     MessageBoxA(NULL, msg, "Auto-Binder - Success", MB_ICONINFORMATION);
     ExitProcess(0);
 }
-

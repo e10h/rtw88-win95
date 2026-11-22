@@ -356,10 +356,15 @@ void mainCRTStartup(void) {
             }
             Print("\r\n");
         } else {
+            DWORD err = GetLastError();
             Print("Poll error (err=");
-            ToDec(numBuf, GetLastError());
+            ToDec(numBuf, err);
             Print(numBuf);
             Print(")\r\n");
+            if (err == 1167 /* ERROR_DEVICE_NOT_CONNECTED */ || err == 31 /* ERROR_GEN_FAILURE */ || err == 2 /* ERROR_FILE_NOT_FOUND */) {
+                Print("[!] Adapter disconnected or removed. Stopping poll loop.\r\n");
+                break;
+            }
         }
         Sleep(100);
     }
