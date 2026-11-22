@@ -23,8 +23,9 @@ AddReg=RTW88.ndi.reg
 DeviceID=USB\VID_0BDA&PID_B812
 
 [RTW88.ndi.reg]
-HKR,,DevLoader,,*ndis
+HKR,,DevLoader,,"*ndis,*ntkern"
 HKR,,DeviceVxDs,,RTW88.SYS
+HKR,,NTMPDriver,,RTW88.SYS
 HKR,,EnumPropPages,,"netdi.dll,EnumPropPages"
 
 ; NDIS Specifics

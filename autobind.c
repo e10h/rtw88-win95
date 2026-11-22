@@ -34,7 +34,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
 
     const char *targetClass = isNetMode ? "Net" : "USB";
     const char *driverName = isNetMode ? "RTW88.SYS" : "RTWPROBE.SYS";
-    const char *devLoader = isNetMode ? "*ndis" : "*ntkern";
+    const char *devLoader = isNetMode ? "*ndis,*ntkern" : "*ntkern";
     const char *driverDesc = isNetMode
         ? "Realtek RTL8822BU Wireless LAN 802.11ac Adapter"
         : "Realtek 8822BU USB Wi-Fi Probe Driver";
@@ -46,6 +46,21 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     StrCat(msg, isNetMode
         ? "=== Binding NDIS 3.1 Miniport Driver (RTW88.SYS) ===\n\n"
         : "=== Binding WDM Diagnostic Driver (RTWPROBE.SYS) ===\n\n");
+
+    /* Auto-copy driver file to C:\WINDOWS\SYSTEM */
+    char sysDir[260];
+    UINT sysLen = GetSystemDirectoryA(sysDir, sizeof(sysDir));
+    if (sysLen > 0 && sysLen < 240) {
+        char destPath[260];
+        StrCpy(destPath, sysDir);
+        StrCat(destPath, "\\");
+        StrCat(destPath, driverName);
+        if (CopyFileA(driverName, destPath, FALSE)) {
+            StrCat(msg, "0. Installed driver to: ");
+            StrCat(msg, destPath);
+            StrCat(msg, "\n");
+        }
+    }
 
     /* 1. Open Services\Class\<targetClass> */
     char classRegPath[128];
@@ -109,6 +124,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
 
     if (isNetMode) {
         RegSetValueExA(hTargetClass, "DeviceVxDs", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
+        RegSetValueExA(hTargetClass, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
 
         /* NDIS Specific Subkeys */
         HKEY hNdis;
@@ -178,10 +194,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             RegSetValueExA(hInstKey, "DeviceDesc", 0, REG_SZ, (const BYTE *)driverDesc, lstrlenA(driverDesc) + 1);
             RegSetValueExA(hInstKey, "Driver", 0, REG_SZ, (const BYTE *)chosenClassPath, lstrlenA(chosenClassPath) + 1);
             RegSetValueExA(hInstKey, "DevLoader", 0, REG_SZ, (const BYTE *)devLoader, lstrlenA(devLoader) + 1);
+            RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
             if (isNetMode) {
                 RegSetValueExA(hInstKey, "DeviceVxDs", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
-            } else {
-                RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
             }
             RegSetValueExA(hInstKey, "ConfigFlags", 0, REG_BINARY, (const BYTE *)&cfgFlags, 4);
 

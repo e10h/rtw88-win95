@@ -10,7 +10,7 @@ RTWPROBE.SYS: rtwprobe.c
 
 RTW88.SYS: rtw88.c ndis31.h
 	$(CC) $(CFLAGS) -shared -Wl,--subsystem,native -Wl,--entry,_DriverEntry@8 \
-	  -Wl,--disable-dynamicbase -Wl,--disable-nxcompat -Wl,--image-base,0x10000 \
+	  -Wl,--kill-at -Wl,--disable-dynamicbase -Wl,--disable-nxcompat -Wl,--image-base,0x10000 \
 	  -nostartfiles -o $@ $< -lndis -lntoskrnl
 
 RTWTEST.EXE: rtwtest.c
