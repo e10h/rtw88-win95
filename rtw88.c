@@ -171,7 +171,7 @@ static NDIS_STATUS NTAPI Rtw88Initialize(
         MiniportAdapterHandle,
         (NDIS_HANDLE)&g_Adapter,
         FALSE,                  /* Not a legacy DMA bus master */
-        NdisInterfaceInternal   /* Standard WDM/internal adapter type */
+        NdisInterfaceIsa        /* Generic external adapter (correct for USB/non-ISA on Win95 NDIS 3.1) */
     );
 
     return NDIS_STATUS_SUCCESS;
@@ -298,6 +298,11 @@ static NDIS_STATUS NTAPI Rtw88QueryInformation(
             pSource = pAdapter ? (PVOID)pAdapter->CurrentMac : (PVOID)g_PermanentMac;
             copyLength = 6;
             break;
+
+        case OID_802_3_MULTICAST_LIST:
+            /* Return empty multicast list — no multicast filtering in this stub */
+            *BytesWritten = 0;
+            return NDIS_STATUS_SUCCESS;
 
         case OID_802_3_MAXIMUM_LIST_SIZE:
             uLongValue = 32;
