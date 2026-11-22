@@ -7,6 +7,8 @@
 #define REG_SYS_FUNC_EN     0x0002
 #define REG_SYS_CLK_CTRL    0x0008
 #define REG_SYS_CFG1        0x00F0
+#define REG_MACID_0610      0x0610
+#define REG_MACID_0050      0x0050
 
 #define IOCTL_RTW_PROBE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
@@ -17,6 +19,10 @@ typedef struct _RTW_PROBE_DATA {
     NTSTATUS status_func;
     NTSTATUS status_clk;
     NTSTATUS status_cfg;
+    UCHAR reg_mac_0610[6];
+    UCHAR reg_mac_0050[6];
+    NTSTATUS status_mac_0610;
+    NTSTATUS status_mac_0050;
 } RTW_PROBE_DATA, *PRTW_PROBE_DATA;
 
 typedef struct _DEVICE_EXTENSION {
@@ -80,6 +86,12 @@ static void ProbeRealtekDevice(PDEVICE_EXTENSION pDevExt) {
     pDevExt->LastProbeData.status_cfg = RTW_UsbReadReg(
         pDevExt->LowerDeviceObject, REG_SYS_CFG1, &pDevExt->LastProbeData.sys_cfg, sizeof(ULONG));
 
+    pDevExt->LastProbeData.status_mac_0610 = RTW_UsbReadReg(
+        pDevExt->LowerDeviceObject, REG_MACID_0610, pDevExt->LastProbeData.reg_mac_0610, 6);
+
+    pDevExt->LastProbeData.status_mac_0050 = RTW_UsbReadReg(
+        pDevExt->LowerDeviceObject, REG_MACID_0050, pDevExt->LastProbeData.reg_mac_0050, 6);
+
     DbgPrint("RTWPROBE: Hardware probed!\n");
 }
 
@@ -89,18 +101,17 @@ static NTSTATUS NTAPI StartCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVO
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
-NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+NTSTATUS NTAPI RTWProbe_Pnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     PDEVICE_EXTENSION pDevExt = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS status;
 
-    switch (stack->MinorFunction) {
+    switch (irpStack->MinorFunction) {
         case IRP_MN_START_DEVICE: {
             KEVENT event;
             KeInitializeEvent(&event, NotificationEvent, FALSE);
             IoCopyCurrentIrpStackLocationToNext(Irp);
             IoSetCompletionRoutine(Irp, StartCompletion, &event, TRUE, TRUE, TRUE);
-
             status = IoCallDriver(pDevExt->LowerDeviceObject, Irp);
             if (status == STATUS_PENDING) {
                 KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
@@ -109,7 +120,7 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
             if (NT_SUCCESS(status)) {
                 pDevExt->DeviceStarted = TRUE;
-                DbgPrint("RTWPROBE: Start Device successful\n");
+                ProbeRealtekDevice(pDevExt);
             }
 
             Irp->IoStatus.Status = status;
@@ -118,10 +129,16 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         }
 
         case IRP_MN_REMOVE_DEVICE: {
+            UNICODE_STRING symLink;
+            RtlInitUnicodeString(&symLink, L"\\DosDevices\\RTWPROBE");
+            IoDeleteSymbolicLink(&symLink);
+            g_pDevExt = NULL;
+
+            Irp->IoStatus.Status = STATUS_SUCCESS;
             IoSkipCurrentIrpStackLocation(Irp);
             status = IoCallDriver(pDevExt->LowerDeviceObject, Irp);
             IoDetachDevice(pDevExt->LowerDeviceObject);
-            IoDeleteDevice(DeviceObject);
+            /* Do NOT call IoDeleteDevice: avoids BugCheck 0x36 completely */
             return status;
         }
 
@@ -131,25 +148,24 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
 }
 
-NTSTATUS NTAPI RtwCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    Irp->IoStatus.Status = STATUS_SUCCESS;
-    Irp->IoStatus.Information = 0;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return STATUS_SUCCESS;
+NTSTATUS NTAPI RTWProbe_Power(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    PDEVICE_EXTENSION pDevExt = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    IoSkipCurrentIrpStackLocation(Irp);
+    return IoCallDriver(pDevExt->LowerDeviceObject, Irp);
 }
 
-NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+NTSTATUS NTAPI RTWProbe_DeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     PDEVICE_EXTENSION pDevExt = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
-    ULONG info = 0;
+    ULONG outLen = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
 
-    if (stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_RTW_PROBE) {
-        if (stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(RTW_PROBE_DATA)) {
-            PRTW_PROBE_DATA out = (PRTW_PROBE_DATA)Irp->AssociatedIrp.SystemBuffer;
+    if (irpStack->Parameters.DeviceIoControl.IoControlCode == IOCTL_RTW_PROBE) {
+        if (outLen >= sizeof(RTW_PROBE_DATA)) {
+            PRTW_PROBE_DATA pOut = (PRTW_PROBE_DATA)Irp->AssociatedIrp.SystemBuffer;
             ProbeRealtekDevice(pDevExt);
-            *out = pDevExt->LastProbeData;
-            info = sizeof(RTW_PROBE_DATA);
+            *pOut = pDevExt->LastProbeData;
+            Irp->IoStatus.Information = sizeof(RTW_PROBE_DATA);
             status = STATUS_SUCCESS;
         } else {
             status = STATUS_BUFFER_TOO_SMALL;
@@ -157,73 +173,75 @@ NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
 
     Irp->IoStatus.Status = status;
-    Irp->IoStatus.Information = info;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
 }
 
-NTSTATUS NTAPI RtwAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDeviceObject) {
-    NTSTATUS status;
+NTSTATUS NTAPI RTWProbe_CreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS NTAPI RTWProbe_AddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDeviceObject) {
     PDEVICE_OBJECT fdo;
     PDEVICE_EXTENSION pDevExt;
-    UNICODE_STRING devName, symName;
+    UNICODE_STRING ntDevName;
+    UNICODE_STRING symLinkName;
+    NTSTATUS status;
 
-    RtlInitUnicodeString(&devName, L"\\Device\\RTWPROBE");
-    RtlInitUnicodeString(&symName, L"\\DosDevices\\RTWPROBE");
+    RtlInitUnicodeString(&ntDevName, L"\\Device\\RTWPROBE");
+    RtlInitUnicodeString(&symLinkName, L"\\DosDevices\\RTWPROBE");
 
     status = IoCreateDevice(
         DriverObject,
         sizeof(DEVICE_EXTENSION),
-        &devName,
+        &ntDevName,
         FILE_DEVICE_UNKNOWN,
         0,
         FALSE,
         &fdo
     );
 
-    if (!NT_SUCCESS(status)) return status;
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    IoCreateSymbolicLink(&symLinkName, &ntDevName);
 
     pDevExt = (PDEVICE_EXTENSION)fdo->DeviceExtension;
+    RtlZeroMemory(pDevExt, sizeof(DEVICE_EXTENSION));
     pDevExt->FunctionalDeviceObject = fdo;
     pDevExt->PhysicalDeviceObject = PhysicalDeviceObject;
-    pDevExt->DeviceStarted = FALSE;
-    g_pDevExt = pDevExt;
-
     pDevExt->LowerDeviceObject = IoAttachDeviceToDeviceStack(fdo, PhysicalDeviceObject);
+
     if (!pDevExt->LowerDeviceObject) {
+        IoDeleteSymbolicLink(&symLinkName);
         IoDeleteDevice(fdo);
         return STATUS_DEVICE_REMOVED;
     }
 
-    status = IoCreateSymbolicLink(&symName, &devName);
+    fdo->Flags |= DO_BUFFERED_IO;
     fdo->Flags &= ~DO_DEVICE_INITIALIZING;
 
-    DbgPrint("RTWPROBE: AddDevice successful\n");
+    g_pDevExt = pDevExt;
     return STATUS_SUCCESS;
 }
 
-NTSTATUS NTAPI RtwPower(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    PDEVICE_EXTENSION pDevExt = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-    IoSkipCurrentIrpStackLocation(Irp);
-    return IoCallDriver(pDevExt->LowerDeviceObject, Irp);
-}
-
-void NTAPI RtwUnload(PDRIVER_OBJECT DriverObject) {
-    UNICODE_STRING symName;
-    RtlInitUnicodeString(&symName, L"\\DosDevices\\RTWPROBE");
-    IoDeleteSymbolicLink(&symName);
+VOID NTAPI RTWProbe_Unload(PDRIVER_OBJECT DriverObject) {
     DbgPrint("RTWPROBE: Driver Unloaded\n");
 }
 
 NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
-    DriverObject->DriverExtension->AddDevice = RtwAddDevice;
-    DriverObject->DriverUnload = RtwUnload;
-    DriverObject->MajorFunction[IRP_MJ_CREATE] = RtwCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE] = RtwCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = RtwDeviceControl;
-    DriverObject->MajorFunction[IRP_MJ_PNP] = RtwPnp;
-    DriverObject->MajorFunction[IRP_MJ_POWER] = RtwPower;
+    DriverObject->DriverExtension->AddDevice = RTWProbe_AddDevice;
+    DriverObject->MajorFunction[IRP_MJ_PNP] = RTWProbe_Pnp;
+    DriverObject->MajorFunction[IRP_MJ_POWER] = RTWProbe_Power;
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = RTWProbe_CreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = RTWProbe_CreateClose;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = RTWProbe_DeviceControl;
+    DriverObject->DriverUnload = RTWProbe_Unload;
 
-    DbgPrint("RTWPROBE: DriverEntry\n");
+    DbgPrint("RTWPROBE: DriverEntry Initialized\n");
     return STATUS_SUCCESS;
 }

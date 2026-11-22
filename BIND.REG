@@ -1,0 +1,20 @@
+REGEDIT4
+
+[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\Class\USB\0002]
+"DevLoader"="*ntkern"
+"NTMPDriver"="RTWPROBE.SYS"
+"DriverDesc"="Realtek 8822BU USB Wi-Fi Probe Driver"
+"MatchingDeviceId"="USB\\VID_0BDA&PID_B812"
+"InfPath"="RTWPROBE.INF"
+"InfSection"="RTWProbe_Install"
+"ProviderName"="RetroDev"
+
+[HKEY_LOCAL_MACHINE\Enum\USB\VID_0BDA&PID_B812\1USB&ROOT_HUB&PCI&VEN_1033&DEV_0035&BUS_00&DEV_0B&FUNC_00]
+"Class"="USB"
+"ClassGUID"="{36fc9e60-c465-11cf-8056-444553540000}"
+"DeviceDesc"="Realtek 8822BU USB Wi-Fi Probe Driver"
+"Driver"="USB\\0002"
+"DevLoader"="*ntkern"
+"NTMPDriver"="RTWPROBE.SYS"
+"ConfigFlags"=hex:00,00,00,00
+

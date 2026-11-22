@@ -9,6 +9,10 @@ typedef struct _RTW_PROBE_DATA {
     long status_func;
     long status_clk;
     long status_cfg;
+    unsigned char reg_mac_0610[6];
+    unsigned char reg_mac_0050[6];
+    long status_mac_0610;
+    long status_mac_0050;
 } RTW_PROBE_DATA;
 
 static void ToHex16(char *buf, unsigned short val) {
@@ -35,6 +39,16 @@ static void ToHex32(char *buf, unsigned long val) {
     buf[8] = hex[(val >> 4) & 0xF];
     buf[9] = hex[val & 0xF];
     buf[10] = '\0';
+}
+
+static void FormatMac(char *dest, const unsigned char *mac) {
+    const char hex[] = "0123456789ABCDEF";
+    for (int i = 0; i < 6; i++) {
+        *dest++ = hex[(mac[i] >> 4) & 0xF];
+        *dest++ = hex[mac[i] & 0xF];
+        if (i < 5) *dest++ = ':';
+    }
+    *dest = '\0';
 }
 
 static void StrCat(char *dest, const char *src) {
@@ -87,41 +101,50 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             "Realtek 8822BU Probe Tool",
             MB_ICONERROR | MB_OK
         );
-        ExitProcess(1);
+        ExitProcess(2);
     }
 
-    char msg[1024];
-    char hexBuf[16];
-
+    char msg[512];
+    char hexBuf[32];
     msg[0] = '\0';
-    StrCat(msg, "SUCCESS! Connected to Nineplus USB Wi-Fi (Realtek 8822BU)!\n");
-    StrCat(msg, "------------------------------------------------------\n");
+
+    StrCat(msg, "SUCCESS! Connected to Nineplus USB Wi-Fi (Realtek 8822BU)!\n\n");
     StrCat(msg, "--- Core Registers ---\n");
 
     StrCat(msg, "REG_SYS_FUNC_EN  (0x0002) = ");
     ToHex16(hexBuf, probeData.func_en);
     StrCat(msg, hexBuf);
-    StrCat(msg, (probeData.status_func == 0) ? "  [OK]\n" : "  [FAIL]\n");
+    if (probeData.status_func == 0) StrCat(msg, "  [OK]\n");
+    else StrCat(msg, "  [FAILED]\n");
 
     StrCat(msg, "REG_SYS_CLK_CTRL (0x0008) = ");
     ToHex16(hexBuf, probeData.clk_ctrl);
     StrCat(msg, hexBuf);
-    StrCat(msg, (probeData.status_clk == 0) ? "  [OK]\n" : "  [FAIL]\n");
+    if (probeData.status_clk == 0) StrCat(msg, "  [OK]\n");
+    else StrCat(msg, "  [FAILED]\n");
 
     StrCat(msg, "REG_SYS_CFG1     (0x00F0) = ");
     ToHex32(hexBuf, probeData.sys_cfg);
     StrCat(msg, hexBuf);
-    StrCat(msg, (probeData.status_cfg == 0) ? "  [OK]\n\n" : "  [FAIL]\n\n");
+    if (probeData.status_cfg == 0) StrCat(msg, "  [OK]\n");
+    else StrCat(msg, "  [FAILED]\n");
 
-    StrCat(msg, "Milestone 1 USB Control Transfer Engine Complete!");
+    StrCat(msg, "\n--- Hardware MAC Address ---\n");
 
-    MessageBoxA(
-        NULL,
-        msg,
-        "Nineplus Realtek 8822BU Hardware Verification",
-        MB_ICONINFORMATION | MB_OK
-    );
+    StrCat(msg, "MAC (Port 0 Reg 0x0610):  ");
+    FormatMac(hexBuf, probeData.reg_mac_0610);
+    StrCat(msg, hexBuf);
+    if (probeData.status_mac_0610 == 0) StrCat(msg, "  [OK]\n");
+    else StrCat(msg, "  [FAILED]\n");
 
+    StrCat(msg, "MAC (Station Reg 0x0050): ");
+    FormatMac(hexBuf, probeData.reg_mac_0050);
+    StrCat(msg, hexBuf);
+    if (probeData.status_mac_0050 == 0) StrCat(msg, "  [OK]\n");
+    else StrCat(msg, "  [FAILED]\n");
+
+    StrCat(msg, "\nMilestone 2 MAC Identification Complete!");
+
+    MessageBoxA(NULL, msg, "Realtek 8822BU Probe Tool - Milestone 2", MB_ICONINFORMATION | MB_OK);
     ExitProcess(0);
-    return 0;
 }
