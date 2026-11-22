@@ -606,6 +606,50 @@ NTSTATUS NTAPI RtwCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     return STATUS_SUCCESS;
 }
 
+static void RTW_InitRadioChannel(PDEVICE_OBJECT dev, UCHAR channel) {
+    if (channel == 0 || channel > 14) channel = 6;
+
+    /* 1. Power on Baseband (BB) & RF domains */
+    USHORT funcEn = RTW_Read16(dev, 0x0002);
+    RTW_Write16(dev, 0x0002, funcEn | 0x0003); /* BIT_FEN_BB_RSTB | BIT_FEN_BB_GLB_RST */
+
+    RTW_Write8(dev, 0x001F, 0x07); /* REG_RF_CTRL: BIT_RF_EN | BIT_RF_RSTB | BIT_RF_SDM_RSTB */
+
+    ULONG wlrf1 = RTW_Read32(dev, 0x00EC);
+    RTW_Write32(dev, 0x00EC, wlrf1 | 0x07000000); /* REG_WLRF1: BIT_WLRF1_BBRF_EN */
+
+    /* 2. Configure RX Path Selection */
+    ULONG rxpsel = RTW_Read32(dev, 0x0808);
+    rxpsel &= ~0x00000001; /* Clear RX_PSEL_RST */
+    rxpsel |= 0x11;        /* Enable antenna on Path A and Path B */
+    RTW_Write32(dev, 0x0808, rxpsel);
+
+    /* 3. Configure MAC Protocol & Bandwidth (20MHz in 2.4GHz) */
+    ULONG trxptcl = RTW_Read32(dev, 0x0668);
+    trxptcl &= ~0x0180; /* Clear BIT_RFMOD (20MHz bandwidth) */
+    RTW_Write32(dev, 0x0668, trxptcl);
+
+    RTW_Write8(dev, 0x0483, 0x00); /* REG_DATA_SC: primary 20MHz */
+
+    UCHAR cckCheck = RTW_Read8(dev, 0x0817);
+    RTW_Write8(dev, 0x0817, cckCheck & ~0x80); /* Enable CCK / 802.11b */
+
+    /* 4. Set Initial Gain Index (IGI) sensitivity on Path A (0xC50) and Path B (0xE50) */
+    ULONG igiA = RTW_Read32(dev, 0x0C50) & ~0x7F;
+    RTW_Write32(dev, 0x0C50, igiA | 0x32); /* 0x32 = ~ -70dBm sensitivity */
+
+    ULONG igiB = RTW_Read32(dev, 0x0E50) & ~0x7F;
+    RTW_Write32(dev, 0x0E50, igiB | 0x32);
+
+    /* 5. Tune RF Synthesizer via SIPI to target channel (2.4GHz band) */
+    /* RF Reg 0x18: bit 0..7 = channel, bit 10..11 = 0x0C00 (20MHz) */
+    ULONG rfVal = 0x0C00 | (channel & 0xFF);
+    RTW_Write32(dev, 0x0C90, (0x18UL << 20) | rfVal); /* Path A */
+    RTW_Write32(dev, 0x0E90, (0x18UL << 20) | rfVal); /* Path B */
+
+    DbgPrint("RTWPROBE: Radio tuned to Channel %d (2.4 GHz, IGI=0x32)\n", (int)channel);
+}
+
 NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
     PDEVICE_EXTENSION pDevExt = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
@@ -728,13 +772,22 @@ NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 RTW_ConfigureDevice(pDevExt);
             }
 
-            /* 1. Turn on MAC & HCI TX/RX DMA engines in REG_CR */
+            UCHAR channel = 6;
+            if (stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(ULONG)) {
+                ULONG ch = *(PULONG)Irp->AssociatedIrp.SystemBuffer;
+                if (ch >= 1 && ch <= 14) channel = (UCHAR)ch;
+            }
+
+            /* 1. Turn on BB/RF domains & tune synthesizer to channel */
+            RTW_InitRadioChannel(dev, channel);
+
+            /* 2. Turn on MAC & HCI TX/RX DMA engines in REG_CR */
             RTW_Write8(dev, REG_CR, 0xFF);
 
-            /* 2. Configure RCR: 0xE400220F (Accept Broadcast, Multicast, Unicast, Promiscuous) */
+            /* 3. Configure RCR: 0xE400220F (Accept Broadcast, Multicast, Unicast, Promiscuous) */
             RTW_Write32(dev, REG_RCR, 0xE400220F);
 
-            /* 3. Configure RXDMA Mode (0x0290) */
+            /* 4. Configure RXDMA Mode (0x0290) */
             RTW_Write8(dev, REG_RXDMA_MODE, 0x00);
 
             if (stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(ULONG) * 3) {
