@@ -566,8 +566,6 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             RtlInitUnicodeString(&symLink, L"\\DosDevices\\RTWPROBE");
             IoDeleteSymbolicLink(&symLink);
 
-            DeviceObject->ReferenceCount = 0;
-
             Irp->IoStatus.Status = STATUS_SUCCESS;
             IoSkipCurrentIrpStackLocation(Irp);
             return IoCallDriver(pDevExt->LowerDeviceObject, Irp);
@@ -576,21 +574,30 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         case IRP_MN_REMOVE_DEVICE: {
             UNICODE_STRING symLink;
             PDEVICE_OBJECT lowerDev = pDevExt->LowerDeviceObject;
+            NTSTATUS status;
+
             RtlInitUnicodeString(&symLink, L"\\DosDevices\\RTWPROBE");
             IoDeleteSymbolicLink(&symLink);
             g_pDevExt = NULL;
             pDevExt->LowerDeviceObject = NULL;
 
+            /* 1. Forward IRP down the stack to lower driver first */
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            IoSkipCurrentIrpStackLocation(Irp);
+            status = IoCallDriver(lowerDev, Irp);
+
+            /* 2. Detach lower device object after stack processing completes */
             if (lowerDev) {
                 IoDetachDevice(lowerDev);
             }
 
+            /* 3. Ensure reference count is zero before deletion */
             DeviceObject->ReferenceCount = 0;
 
-            Irp->IoStatus.Status = STATUS_SUCCESS;
-            IoSkipCurrentIrpStackLocation(Irp);
-            /* Do NOT call IoDeleteDevice: NTKERN.VXD handles device cleanup; avoids BugCheck 0x36 completely */
-            return IoCallDriver(lowerDev, Irp);
+            /* 4. Delete the Functional Device Object (FDO) */
+            IoDeleteDevice(DeviceObject);
+
+            return status;
         }
 
         default:
