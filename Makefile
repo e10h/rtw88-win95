@@ -1,5 +1,5 @@
 CC = i686-w64-mingw32-gcc
-CFLAGS = -O2 -s
+CFLAGS = -O2 -s -march=pentium-mmx -mtune=pentium-mmx -mno-stack-arg-probe
 
 all: RTWPROBE.SYS RTWTEST.EXE AUTOBIND.EXE
 

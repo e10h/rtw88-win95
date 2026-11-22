@@ -129,9 +129,12 @@ i686-w64-mingw32-gcc -O2 -s -nostdlib -e _WinMain@16 \
   - Read MAC Port 0 (`0x0610`) and Station (`0x0050`) registers.
   - Implement safe unplugging without Bug Check 0x36.
   - Automated dynamic registry binding tool (`AUTOBIND.EXE`).
-- [ ] **Milestone 3: Firmware Upload & CPU Startup**
-  - Stream `rtw8822b_fw.bin` into chip SRAM across USB vendor transfers.
-  - Initialize 32-bit RISC WLAN CPU (`REG_MCUFW_CTRL`).
+- [x] **Milestone 3: Firmware Upload & RISC CPU Boot (Verified on Real Iron)**
+  - Select USB configuration and open 5 active communication pipes (EP 84 IN, EP 05 OUT, EP 06 OUT, EP 87 IN, EP 08 OUT).
+  - Stream `rtw8822b_fw.bin` (40 pages / 160 KB) into chip memory via DDMA page engine.
+  - Boot 32-bit RISC WLAN CPU (`RTW_WCPU_3081`), confirmed by `REG_MCUFW_CTRL = 0xA280` (`BIT_FW_INIT_RDY` active).
+  - Verified post-boot MAC address retrieval from internal eFuse (`80:42:EF:68:80:42`).
+  - Resolved NTKERN Bug Check 0x36 on USB surprise removal and eliminated Pentium MMX `#UD` invalid opcode faults.
 - [ ] **Milestone 4: NDIS 3.1 / 5.0 Miniport & TCP/IP Binding**
   - Bind to Windows 95 network subsystem.
   - 802.11 beacon scanning and WPA/WPA2-PSK or open Wi-Fi association.
