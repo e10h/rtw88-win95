@@ -648,14 +648,6 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 IoCompleteRequest(Irp, IO_NO_INCREMENT);
             }
 
-            /* 3. In Windows 95 NTKERN, NTKERN owns the FDO lifecycle after detaching.
-             * Explicitly calling IoDeleteDevice when user-mode handles or NTKERN
-             * hold references triggers KeBugCheckEx 0x36 (DEVICE_REFERENCE_COUNT_NOT_ZERO)
-             * at c029c2e2. Only delete if reference count is cleanly zero. */
-            if (DeviceObject->ReferenceCount == 0) {
-                IoDeleteDevice(DeviceObject);
-            }
-
             return status;
         }
 
@@ -666,17 +658,6 @@ NTSTATUS NTAPI RtwPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 NTSTATUS NTAPI RtwCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
-    PDEVICE_EXTENSION pDevExt = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-
-    if (stack->MajorFunction == IRP_MJ_CLOSE) {
-        /* If the device has been removed and this was the final open handle,
-         * delete the orphaned DeviceObject safely. */
-        if ((!g_pDevExt || (pDevExt && pDevExt->DeviceRemoved)) && DeviceObject->ReferenceCount <= 1) {
-            IoDeleteDevice(DeviceObject);
-        }
-    }
-
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);

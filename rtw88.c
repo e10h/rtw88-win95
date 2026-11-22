@@ -413,10 +413,6 @@ static NTSTATUS NTAPI Rtw88Pnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 IoCompleteRequest(Irp, IO_NO_INCREMENT);
             }
 
-            if (DeviceObject->ReferenceCount == 0) {
-                IoDeleteDevice(DeviceObject);
-            }
-
             return status;
         }
 
@@ -433,15 +429,6 @@ static NTSTATUS NTAPI Rtw88Power(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 static NTSTATUS NTAPI Rtw88CreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
-    PDEVICE_EXTENSION pDevExt = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-
-    if (stack->MajorFunction == IRP_MJ_CLOSE) {
-        if ((!g_pWdmDevExt || (pDevExt && pDevExt->DeviceRemoved)) && DeviceObject->ReferenceCount <= 1) {
-            IoDeleteDevice(DeviceObject);
-        }
-    }
-
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
