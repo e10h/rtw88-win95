@@ -34,7 +34,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
 
     const char *targetClass = isNetMode ? "Net" : "USB";
     const char *driverName = isNetMode ? "RTW88.SYS" : "RTWPROBE.SYS";
-    const char *devLoader = "*ntkern";
+    const char *devLoader = isNetMode ? "*ndis" : "*ntkern";
     const char *driverDesc = isNetMode
         ? "Realtek RTL8822BU Wireless LAN 802.11ac Adapter"
         : "Realtek 8822BU USB Wi-Fi Probe Driver";
@@ -124,7 +124,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
 
     if (isNetMode) {
         RegSetValueExA(hTargetClass, "DeviceVxDs", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
-        RegSetValueExA(hTargetClass, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
+        RegDeleteValueA(hTargetClass, "NTMPDriver");
 
         /* NDIS Specific Subkeys */
         HKEY hNdis;
@@ -194,9 +194,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             RegSetValueExA(hInstKey, "DeviceDesc", 0, REG_SZ, (const BYTE *)driverDesc, lstrlenA(driverDesc) + 1);
             RegSetValueExA(hInstKey, "Driver", 0, REG_SZ, (const BYTE *)chosenClassPath, lstrlenA(chosenClassPath) + 1);
             RegSetValueExA(hInstKey, "DevLoader", 0, REG_SZ, (const BYTE *)devLoader, lstrlenA(devLoader) + 1);
-            RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
             if (isNetMode) {
                 RegSetValueExA(hInstKey, "DeviceVxDs", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
+                RegDeleteValueA(hInstKey, "NTMPDriver");
+            } else {
+                RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ, (const BYTE *)driverName, lstrlenA(driverName) + 1);
+                RegDeleteValueA(hInstKey, "DeviceVxDs");
             }
             RegSetValueExA(hInstKey, "ConfigFlags", 0, REG_BINARY, (const BYTE *)&cfgFlags, 4);
 

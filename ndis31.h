@@ -8,9 +8,7 @@
 #ifndef _NDIS31_H_
 #define _NDIS31_H_
 
-#ifndef _WDMDDK_
 #include <windows.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
