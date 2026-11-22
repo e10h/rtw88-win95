@@ -1,0 +1,50 @@
+; RTWPROBE.INF
+; Realtek RTL8822BU (VID_0BDA&PID_B812) USB Probe Driver for Windows 95
+
+[Version]
+Signature="$CHICAGO$"
+Class=USB
+ClassGUID={36fc9e60-c465-11cf-8056-444553540000}
+Provider=%ProviderName%
+
+[DefaultInstall]
+CopyFiles=RTWProbe_CopyFiles
+AddReg=RTWProbe_AddReg
+
+[Manufacturer]
+%MfgName%=RealtekDevices
+
+[RealtekDevices]
+%DeviceDesc%=RTWProbe_Install, USB\VID_0BDA&PID_B812
+%DeviceDesc%=RTWProbe_Install, USB\VID_0bda&PID_b812
+%DeviceDesc%=RTWProbe_Install, USB\VID_0BDA&PID_B812&REV_0200
+%DeviceDesc%=RTWProbe_Install, USB\VID_0BDA&PID_B812&REV_0210
+%DeviceDesc%=RTWProbe_Install, USB\VID_0bda&PID_b812&rev_0200
+%DeviceDesc%=RTWProbe_Install, USB\VID_0bda&PID_b812&rev_0210
+%DeviceDesc%=RTWProbe_Install, USB\UNKNOWN
+
+[RTWProbe_Install]
+CopyFiles=RTWProbe_CopyFiles
+AddReg=RTWProbe_AddReg
+
+[RTWProbe_CopyFiles]
+RTWPROBE.SYS
+
+[RTWProbe_AddReg]
+HKR,,DevLoader,,*ntkern
+HKR,,NTMPDriver,,RTWPROBE.SYS
+
+[DestinationDirs]
+DefaultDestDir=10,system32\drivers
+RTWProbe_CopyFiles=10,system32\drivers
+
+[SourceDisksNames]
+1="Realtek USB Probe Driver Disk",,0
+
+[SourceDisksFiles]
+RTWPROBE.SYS=1
+
+[Strings]
+ProviderName="RetroDev"
+MfgName="Realtek"
+DeviceDesc="Realtek 8822BU USB Wi-Fi Probe Driver"

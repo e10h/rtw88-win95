@@ -1,0 +1,9 @@
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Object files and temporary build artifacts
+*.o
+*.obj
+*.tmp
+
