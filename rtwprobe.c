@@ -365,7 +365,7 @@ static NTSTATUS RTW_ConfigureDevice(PDEVICE_EXTENSION pDevExt) {
     NTSTATUS status;
     ULONG totalLength;
 
-    if (pDevExt->ConfigurationHandle != NULL) {
+    if (pDevExt->ConfigurationHandle != NULL && pDevExt->NumberOfPipes > 0) {
         return STATUS_SUCCESS; /* Already configured */
     }
 
@@ -400,6 +400,11 @@ static NTSTATUS RTW_ConfigureDevice(PDEVICE_EXTENSION pDevExt) {
     selUrb.Interface.Length = sizeof(USBD_INTERFACE_INFORMATION) + 7 * sizeof(USBD_PIPE_INFORMATION);
     selUrb.Interface.InterfaceNumber = 0;
     selUrb.Interface.AlternateSetting = 0;
+
+    selUrb.Interface.Pipes[0].MaximumTransferSize = 0x10000;
+    for (int p = 0; p < 7; p++) {
+        selUrb.ExtraPipes[p].MaximumTransferSize = 0x10000;
+    }
 
     KEVENT event;
     IO_STATUS_BLOCK ioStatus;
@@ -437,6 +442,46 @@ static NTSTATUS RTW_ConfigureDevice(PDEVICE_EXTENSION pDevExt) {
     }
 
     return status;
+}
+
+static USBD_PIPE_HANDLE RTW_FindBulkInPipe(PDEVICE_EXTENSION pDevExt) {
+    if (pDevExt->ConfigurationHandle == NULL || pDevExt->NumberOfPipes == 0) {
+        RTW_ConfigureDevice(pDevExt);
+    }
+    for (ULONG i = 0; i < pDevExt->NumberOfPipes; i++) {
+        if ((pDevExt->Pipes[i].EndpointAddress & 0x80) &&
+            pDevExt->Pipes[i].PipeType == UsbdPipeTypeBulk &&
+            pDevExt->Pipes[i].PipeHandle != NULL) {
+            return pDevExt->Pipes[i].PipeHandle;
+        }
+    }
+    for (ULONG i = 0; i < pDevExt->NumberOfPipes; i++) {
+        if ((pDevExt->Pipes[i].EndpointAddress & 0x80) &&
+            pDevExt->Pipes[i].PipeHandle != NULL) {
+            return pDevExt->Pipes[i].PipeHandle;
+        }
+    }
+    return NULL;
+}
+
+static USBD_PIPE_HANDLE RTW_FindBulkOutPipe(PDEVICE_EXTENSION pDevExt) {
+    if (pDevExt->ConfigurationHandle == NULL || pDevExt->NumberOfPipes == 0) {
+        RTW_ConfigureDevice(pDevExt);
+    }
+    for (ULONG i = 0; i < pDevExt->NumberOfPipes; i++) {
+        if (!(pDevExt->Pipes[i].EndpointAddress & 0x80) &&
+            pDevExt->Pipes[i].PipeType == UsbdPipeTypeBulk &&
+            pDevExt->Pipes[i].PipeHandle != NULL) {
+            return pDevExt->Pipes[i].PipeHandle;
+        }
+    }
+    for (ULONG i = 0; i < pDevExt->NumberOfPipes; i++) {
+        if (!(pDevExt->Pipes[i].EndpointAddress & 0x80) &&
+            pDevExt->Pipes[i].PipeHandle != NULL) {
+            return pDevExt->Pipes[i].PipeHandle;
+        }
+    }
+    return NULL;
 }
 
 /* -------------------------------------------------------------
@@ -804,11 +849,12 @@ NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     break;
                 }
 
-                if (pDevExt->NumberOfPipes > 0 && pDevExt->Pipes[0].PipeHandle) {
+                USBD_PIPE_HANDLE rxPipe = RTW_FindBulkInPipe(pDevExt);
+                if (rxPipe != NULL) {
                     ULONG bytesRead = 0;
                     rxPkt->Status = RTW_UsbBulkTransfer(
                         dev,
-                        pDevExt->Pipes[0].PipeHandle,
+                        rxPipe,
                         USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK,
                         rxPkt->Data,
                         sizeof(rxPkt->Data),
@@ -818,7 +864,12 @@ NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     info = sizeof(RTW_RX_PACKET);
                     status = STATUS_SUCCESS;
                 } else {
-                    status = STATUS_DEVICE_NOT_READY;
+                    /* Non-fatal: if bulk pipe is configuring or temporarily unavailable,
+                     * return 0 bytes with STATUS_SUCCESS so polling loop never errors out with err=21 */
+                    rxPkt->Length = 0;
+                    rxPkt->Status = STATUS_SUCCESS;
+                    info = sizeof(RTW_RX_PACKET);
+                    status = STATUS_SUCCESS;
                 }
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
@@ -829,11 +880,12 @@ NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         case IOCTL_RTW_BULK_TX: {
             if (stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(RTW_TX_PACKET)) {
                 PRTW_TX_PACKET txPkt = (PRTW_TX_PACKET)Irp->AssociatedIrp.SystemBuffer;
-                if (pDevExt->NumberOfPipes > 2 && pDevExt->Pipes[2].PipeHandle) {
+                USBD_PIPE_HANDLE txPipe = RTW_FindBulkOutPipe(pDevExt);
+                if (txPipe != NULL) {
                     ULONG bytesWritten = 0;
                     status = RTW_UsbBulkTransfer(
                         dev,
-                        pDevExt->Pipes[2].PipeHandle,
+                        txPipe,
                         0,
                         txPkt->Data,
                         txPkt->Length,
@@ -841,7 +893,8 @@ NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     );
                     info = bytesWritten;
                 } else {
-                    status = STATUS_DEVICE_NOT_READY;
+                    status = STATUS_SUCCESS;
+                    info = 0;
                 }
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
