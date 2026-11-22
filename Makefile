@@ -11,7 +11,7 @@ RTWPROBE.SYS: rtwprobe.c
 RTW88.SYS: rtw88.c ndis31.h
 	$(CC) $(CFLAGS) -shared -Wl,--subsystem,native -Wl,--entry,_DriverEntry@8 \
 	  -Wl,--kill-at -Wl,--disable-dynamicbase -Wl,--disable-nxcompat -Wl,--image-base,0x10000 \
-	  -nostartfiles -o $@ $< -lndis -lntoskrnl
+	  -nostartfiles -o $@ $< -lndis -lntoskrnl -lusbd
 
 RTWTEST.EXE: rtwtest.c
 	$(CC) $(CFLAGS) -nostdlib -e _WinMain@16 -o $@ $< -lkernel32 -luser32
