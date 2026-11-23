@@ -1,18 +1,25 @@
 /*
- * rtw88_vxd.c - Native Windows 95 NDIS 3.0/3.1 LE VxD MAC Driver
- * Target: Realtek RTL8822BU Wi-Fi (USB\VID_0BDA&PID_B812) on Windows 95 OSR 2.1
- * Architecture: Pentium MMX (strictly 0 CMOV instructions)
+ * rtw88_vxd.c - Native Windows 95 NDIS 3.0/3.1 LE VxD MAC Driver (Milestone 6)
+ * Target: Realtek RTL8822BU Wi-Fi on Windows 95 OSR 2.1 (Pentium MMX, 0 CMOV)
  *
  * Links directly against Microsoft Win95 DDK libndis.clb (VxD INT 20h stubs)
- * and rtw88vxd.asm (VxD DDB + Control Dispatch) into LE-format RTW88.VXD.
+ * and rtw88vxd.asm (VxD DDB + Control Dispatch) into single-object LE RTW88.VXD.
  *
- * CRITICAL: Win95 NDIS.VXD and libndis.clb are compiled with 1-byte struct
- * packing (-Zdp / -Zp1). All NDIS structures below use #pragma pack(push, 1).
+ * Milestone 6 features:
+ *   - 16-slot Ring-0 TX Ethernet frame ring buffer (allocated via NdisAllocateMemory)
+ *   - Real NdisQueryPacket/NdisQueryBuffer/NdisGetNextBuffer flattening in Rtw88Send
+ *   - Live RX Ethernet frame injection via NdisIndicateReceive + Rtw88TransferData
+ *   - W32_DEVICEIOCONTROL API:
+ *       DIOC 1 = GET_DIAG  (status + TX/RX counters + current MAC)
+ *       DIOC 2 = POP_TX    (dequeue next outbound Ethernet frame)
+ *       DIOC 3 = INJECT_RX (inject inbound Ethernet frame into VTCP.386)
+ *       DIOC 4 = SET_MAC   (update adapter MAC address)
+ *
+ * CRITICAL: Win95 NDIS.VXD and libndis.clb use 1-byte struct packing (-Zp1).
  */
 
 #pragma pack(push, 1)
 
-/* Basic Win95 DDK types */
 typedef void            VOID, *PVOID;
 typedef char            CHAR, *PCHAR;
 typedef unsigned char   UCHAR, *PUCHAR;
@@ -33,6 +40,7 @@ typedef unsigned long   ULONG, *PULONG;
 typedef ULONG  NDIS_STATUS, *PNDIS_STATUS;
 typedef PVOID  NDIS_HANDLE, *PNDIS_HANDLE;
 typedef ULONG  NDIS_OID, *PNDIS_OID;
+typedef ULONG  NDIS_PHYSICAL_ADDRESS;
 typedef INT    NDIS_SPIN_LOCK, *PNDIS_SPIN_LOCK;
 typedef ULONG  NTSTATUS;
 
@@ -56,7 +64,6 @@ typedef STRING NDIS_STRING, *PNDIS_STRING;
 #define NDIS_STATUS_INVALID_OID             ((NDIS_STATUS)0xC0010017L)
 #define NDIS_STATUS_UNSUPPORTED_MEDIA       ((NDIS_STATUS)0xC0010019L)
 
-/* Medium types */
 typedef enum _NDIS_MEDIUM {
     NdisMedium802_3 = 0,
     NdisMedium802_5,
@@ -68,7 +75,6 @@ typedef enum _NDIS_MEDIUM {
     NdisMediumArcnet878_2
 } NDIS_MEDIUM, *PNDIS_MEDIUM;
 
-/* Hardware status */
 typedef enum _NDIS_HARDWARE_STATUS {
     NdisHardwareStatusReady = 0,
     NdisHardwareStatusInitializing,
@@ -77,7 +83,6 @@ typedef enum _NDIS_HARDWARE_STATUS {
     NdisHardwareStatusNotReady
 } NDIS_HARDWARE_STATUS, *PNDIS_HARDWARE_STATUS;
 
-/* Interface / bus types (exact Win95 DDK ndis.h enum values) */
 typedef enum _NDIS_INTERFACE_TYPE {
     NdisInterfaceInternal = 0,
     NdisInterfaceIsa = 1,
@@ -88,7 +93,6 @@ typedef enum _NDIS_INTERFACE_TYPE {
     NdisInterfacePcMcia = 8
 } NDIS_INTERFACE_TYPE, *PNDIS_INTERFACE_TYPE;
 
-/* NDIS Port Descriptor & Adapter Information (pack(1) exact match to Win95 ndis.h) */
 typedef struct _NDIS_PORT_DESCRIPTOR {
     ULONG InitialPort;
     ULONG NumberOfPorts;
@@ -113,7 +117,6 @@ typedef struct _NDIS_ADAPTER_INFORMATION {
     NDIS_PORT_DESCRIPTOR PortDescriptors[1];
 } NDIS_ADAPTER_INFORMATION, *PNDIS_ADAPTER_INFORMATION;
 
-/* NDIS Request structures (exact Win95 DDK ndis.h layout) */
 typedef enum _NDIS_REQUEST_TYPE {
     NdisRequestQueryInformation = 0,
     NdisRequestSetInformation,
@@ -150,11 +153,12 @@ typedef struct _NDIS_REQUEST {
     } DATA;
 } NDIS_REQUEST, *PNDIS_REQUEST;
 
-/* Forward declarations for packets/buffers */
+/* Opaque packet/buffer pointers (accessed strictly via libndis.clb functions) */
 struct _NDIS_PACKET;
+struct _NDIS_BUFFER;
 typedef struct _NDIS_PACKET *PNDIS_PACKET;
+typedef struct _NDIS_BUFFER *PNDIS_BUFFER;
 
-/* NDIS 3.0/3.1 MAC Handler Typedefs (exact Win95 DDK ndis.h) */
 typedef NDIS_STATUS (NDIS_API *OPEN_ADAPTER_HANDLER)(
     PNDIS_STATUS OpenErrorStatus,
     NDIS_HANDLE *MacBindingHandle,
@@ -225,6 +229,44 @@ typedef struct _NDIS_MAC_CHARACTERISTICS {
     NDIS_STRING Name;
 } NDIS_MAC_CHARACTERISTICS, *PNDIS_MAC_CHARACTERISTICS;
 
+typedef struct _DIOCPARAMETERS {
+    ULONG Internal1;
+    ULONG VMHandle;
+    ULONG Internal2;
+    ULONG dwIoControlCode;
+    ULONG lpvInBuffer;
+    ULONG cbInBuffer;
+    ULONG lpvOutBuffer;
+    ULONG cbOutBuffer;
+    ULONG lpcbBytesReturned;
+    ULONG lpoOverlapped;
+    ULONG hDevice;
+    ULONG tagProcess;
+} DIOCPARAMETERS, *PDIOCPARAMETERS;
+
+typedef struct _RTW88_DIAG {
+    ULONG Magic;
+    ULONG InitCalls;
+    ULONG NdisGetVerCarry;
+    ULONG NdisVersion;
+    ULONG DriverEntryCalls;
+    ULONG WrapperHandle;
+    ULONG RegMacStatus;
+    ULONG MacHandle;
+    ULONG AddAdapterCalls;
+    ULONG RegAdapterStatus;
+    ULONG AdapterHandle;
+    ULONG OpenAdapterCalls;
+    ULONG TxEnqueued;
+    ULONG TxDequeued;
+    ULONG TxDropped;
+    ULONG RxInjected;
+    ULONG TransferDataCalls;
+    ULONG PktMemAddr;
+    UCHAR CurrentMac[6];
+    UCHAR Reserved[2];
+} RTW88_DIAG, *PRTW88_DIAG;
+
 #pragma pack(pop)
 
 /* Win95 NDIS.VXD imports from libndis.clb (VxD INT 20h stdcall stubs) */
@@ -265,6 +307,53 @@ extern NDIS_STATUS NDIS_API NdisRegisterAdapter(
 
 extern NDIS_STATUS NDIS_API NdisDeregisterAdapter(
     NDIS_HANDLE NdisAdapterHandle
+);
+
+extern NDIS_STATUS NDIS_API NdisAllocateMemory(
+    PVOID *VirtualAddress,
+    UINT Length,
+    UINT MemoryFlags,
+    NDIS_PHYSICAL_ADDRESS HighestAcceptableAddress
+);
+
+extern VOID NDIS_API NdisFreeMemory(
+    PVOID VirtualAddress,
+    UINT Length,
+    UINT MemoryFlags
+);
+
+extern VOID NDIS_API NdisQueryPacket(
+    PNDIS_PACKET Packet,
+    PUINT PhysicalBufferCount,
+    PUINT BufferCount,
+    PNDIS_BUFFER *FirstBuffer,
+    PUINT TotalPacketLength
+);
+
+extern VOID NDIS_API NdisQueryBuffer(
+    PNDIS_BUFFER Buffer,
+    PVOID *VirtualAddress,
+    PUINT Length
+);
+
+extern VOID NDIS_API NdisGetNextBuffer(
+    PNDIS_BUFFER CurrentBuffer,
+    PNDIS_BUFFER *NextBuffer
+);
+
+extern VOID NDIS_API NdisIndicateReceive(
+    PNDIS_STATUS Status,
+    NDIS_HANDLE NdisBindingContext,
+    NDIS_HANDLE MacReceiveContext,
+    PVOID HeaderBuffer,
+    UINT HeaderBufferSize,
+    PVOID LookaheadBuffer,
+    UINT LookaheadBufferSize,
+    UINT PacketSize
+);
+
+extern VOID NDIS_API NdisIndicateReceiveComplete(
+    NDIS_HANDLE NdisBindingContext
 );
 
 /* OIDs (exact Win95 DDK ndis.h values) */
@@ -308,6 +397,12 @@ extern NDIS_STATUS NDIS_API NdisDeregisterAdapter(
 #define NDIS_MAC_OPTION_TRANSFERS_NOT_PEND  0x00000004
 #define NDIS_MAC_OPTION_NO_LOOPBACK         0x00000008
 
+#define NDIS_PACKET_TYPE_DIRECTED           0x00000001
+#define NDIS_PACKET_TYPE_MULTICAST          0x00000002
+#define NDIS_PACKET_TYPE_ALL_MULTICAST      0x00000004
+#define NDIS_PACKET_TYPE_BROADCAST          0x00000008
+#define NDIS_PACKET_TYPE_PROMISCUOUS        0x00000020
+
 /* Adapter Constants */
 #define RTW88_MAX_LOOKAHEAD     1500
 #define RTW88_MAX_FRAME_SIZE    1500
@@ -316,7 +411,28 @@ extern NDIS_STATUS NDIS_API NdisDeregisterAdapter(
 #define RTW88_VENDOR_ID         0x000BDA00
 #define RTW88_MAX_OPENS         16
 
-static const UCHAR g_PermanentMac[6] = { 0x80, 0x42, 0xEF, 0x68, 0x80, 0x42 };
+#define RTW88_TX_SLOTS          16
+#define RTW88_SLOT_SIZE         1536
+
+/* Dynamically allocated Ring-0 packet memory (keeps RTW88.VXD 1 single 4KB page!) */
+typedef struct _RTW88_TX_SLOT {
+    UINT  Length;
+    UCHAR Data[RTW88_SLOT_SIZE];
+} RTW88_TX_SLOT;
+
+typedef struct _RTW88_PKTMEM {
+    volatile UINT TxHead;
+    volatile UINT TxTail;
+    RTW88_TX_SLOT TxRing[RTW88_TX_SLOTS];
+    UCHAR         RxStaging[RTW88_SLOT_SIZE];
+} RTW88_PKTMEM, *PRTW88_PKTMEM;
+
+typedef struct _RTW88_RX_CTX {
+    PUCHAR Payload;
+    UINT   PayloadLen;
+} RTW88_RX_CTX, *PRTW88_RX_CTX;
+
+static UCHAR       g_PermanentMac[6] = { 0x80, 0x42, 0xEF, 0x68, 0x80, 0x42 };
 static const CHAR  g_VendorDesc[]    = "Realtek RTL8822BU Wireless LAN 802.11ac Adapter";
 static CHAR        g_MacNameStr[]    = "RTW88";
 
@@ -355,7 +471,6 @@ static const NDIS_OID g_SupportedOids[] = {
     OID_802_3_XMIT_MORE_COLLISIONS
 };
 
-/* Driver State Structures */
 typedef struct _RTW88_ADAPTER RTW88_ADAPTER, *PRTW88_ADAPTER;
 
 typedef struct _RTW88_OPEN {
@@ -386,38 +501,6 @@ typedef struct _RTW88_MAC_BLOCK {
     NDIS_MAC_CHARACTERISTICS    MacCharacteristics;
 } RTW88_MAC_BLOCK, *PRTW88_MAC_BLOCK;
 
-#pragma pack(push, 1)
-typedef struct _DIOCPARAMETERS {
-    ULONG Internal1;
-    ULONG VMHandle;
-    ULONG Internal2;
-    ULONG dwIoControlCode;
-    ULONG lpvInBuffer;
-    ULONG cbInBuffer;
-    ULONG lpvOutBuffer;
-    ULONG cbOutBuffer;
-    ULONG lpcbBytesReturned;
-    ULONG lpoOverlapped;
-    ULONG hDevice;
-    ULONG tagProcess;
-} DIOCPARAMETERS, *PDIOCPARAMETERS;
-
-typedef struct _RTW88_DIAG {
-    ULONG Magic;
-    ULONG InitCalls;
-    ULONG NdisGetVerCarry;
-    ULONG NdisVersion;
-    ULONG DriverEntryCalls;
-    ULONG WrapperHandle;
-    ULONG RegMacStatus;
-    ULONG MacHandle;
-    ULONG AddAdapterCalls;
-    ULONG RegAdapterStatus;
-    ULONG AdapterHandle;
-    ULONG OpenAdapterCalls;
-} RTW88_DIAG, *PRTW88_DIAG;
-#pragma pack(pop)
-
 extern ULONG g_VxdInitCalls;
 extern ULONG g_VxdNdisCarry;
 extern ULONG g_VxdNdisVer;
@@ -425,8 +508,19 @@ extern ULONG g_VxdNdisVer;
 static RTW88_MAC_BLOCK g_MacBlock = {0};
 static RTW88_ADAPTER   g_Adapter  = {0};
 static RTW88_DIAG      g_Diag     = {0};
+static PRTW88_PKTMEM   g_PktMem   = NULL;
 
-/* Local freestanding helpers (zero CRT dependencies, 0 CMOV) */
+/* Interrupt-safe critical section helpers (Pentium MMX safe, 0 CMOV) */
+static inline ULONG RtwIrqSave(void) {
+    ULONG flags;
+    __asm__ __volatile__("pushfl; popl %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static inline VOID RtwIrqRestore(ULONG flags) {
+    __asm__ __volatile__("pushl %0; popfl" :: "r"(flags) : "memory", "cc");
+}
+
 static VOID RtwZeroMem(PVOID dst, UINT len) {
     volatile UCHAR *p = (volatile UCHAR *)dst;
     UINT i;
@@ -441,6 +535,17 @@ static VOID RtwCopyMem(PVOID dst, const VOID *src, UINT len) {
     UINT i;
     for (i = 0; i < len; i++) {
         d[i] = s[i];
+    }
+}
+
+static VOID RtwEnsurePktMem(void) {
+    if (!g_PktMem) {
+        PVOID mem = NULL;
+        if (NdisAllocateMemory(&mem, sizeof(RTW88_PKTMEM), 0, 0xFFFFFFFFUL) == NDIS_STATUS_SUCCESS && mem) {
+            RtwZeroMem(mem, sizeof(RTW88_PKTMEM));
+            g_PktMem = (PRTW88_PKTMEM)mem;
+            g_Diag.PktMemAddr = (ULONG)mem;
+        }
     }
 }
 
@@ -477,31 +582,158 @@ static NDIS_STATUS NDIS_API Rtw88AddAdapter(
 );
 static VOID NDIS_API Rtw88RemoveAdapter(NDIS_HANDLE MacAdapterContext);
 
+/* Check if an Ethernet frame destination matches an open binding's PacketFilter */
+static BOOLEAN RtwMatchFilter(ULONG filter, const UCHAR *dstMac, const UCHAR *myMac) {
+    if (filter == 0) {
+        return FALSE;
+    }
+    if (filter & NDIS_PACKET_TYPE_PROMISCUOUS) {
+        return TRUE;
+    }
+    /* Broadcast FF:FF:FF:FF:FF:FF */
+    if (dstMac[0] == 0xFF && dstMac[1] == 0xFF && dstMac[2] == 0xFF &&
+        dstMac[3] == 0xFF && dstMac[4] == 0xFF && dstMac[5] == 0xFF) {
+        return (filter & NDIS_PACKET_TYPE_BROADCAST) ? TRUE : FALSE;
+    }
+    /* Multicast (LSB of byte 0 == 1) */
+    if (dstMac[0] & 0x01) {
+        return (filter & (NDIS_PACKET_TYPE_MULTICAST | NDIS_PACKET_TYPE_ALL_MULTICAST)) ? TRUE : FALSE;
+    }
+    /* Directed unicast */
+    if (filter & NDIS_PACKET_TYPE_DIRECTED) {
+        if (dstMac[0] == myMac[0] && dstMac[1] == myMac[1] && dstMac[2] == myMac[2] &&
+            dstMac[3] == myMac[3] && dstMac[4] == myMac[4] && dstMac[5] == myMac[5]) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 /* ---------------------------------------------------------------------------
- * W32_DEVICEIOCONTROL - Live telemetry for VXDDIAG.EXE (zero reboot needed!)
+ * W32_DEVICEIOCONTROL - Bridge & Diagnostics API (DIOC 1..4)
  * --------------------------------------------------------------------------- */
 ULONG NDIS_API Rtw88DeviceIoControl(PDIOCPARAMETERS pDioc) {
     if (!pDioc) {
         return 0;
     }
-    if (pDioc->dwIoControlCode == 0 || pDioc->dwIoControlCode == 0xFFFFFFFFUL) {
-        return 0; /* DIOC_OPEN / DIOC_CLOSEHANDLE */
-    }
-    if (pDioc->dwIoControlCode == 1) {
-        g_Diag.Magic           = 0x38385452UL; /* "RT88" */
-        g_Diag.InitCalls       = g_VxdInitCalls;
-        g_Diag.NdisGetVerCarry = g_VxdNdisCarry;
-        g_Diag.NdisVersion     = g_VxdNdisVer;
-        if (pDioc->lpvOutBuffer && pDioc->cbOutBuffer >= sizeof(RTW88_DIAG)) {
-            RtwCopyMem((PVOID)pDioc->lpvOutBuffer, &g_Diag, sizeof(RTW88_DIAG));
+
+    switch (pDioc->dwIoControlCode) {
+        case 0:             /* DIOC_OPEN */
+        case 0xFFFFFFFFUL:  /* DIOC_CLOSEHANDLE */
+            return 0;
+
+        /* DIOC 1: Get Diagnostics + Counters */
+        case 1: {
+            g_Diag.Magic           = 0x38385452UL; /* "RT88" */
+            g_Diag.InitCalls       = g_VxdInitCalls;
+            g_Diag.NdisGetVerCarry = g_VxdNdisCarry;
+            g_Diag.NdisVersion     = g_VxdNdisVer;
+            g_Diag.PktMemAddr      = (ULONG)g_PktMem;
+            RtwCopyMem(g_Diag.CurrentMac, g_Adapter.Active ? g_Adapter.CurrentMac : g_PermanentMac, 6);
+
+            if (pDioc->lpvOutBuffer && pDioc->cbOutBuffer >= sizeof(RTW88_DIAG)) {
+                RtwCopyMem((PVOID)pDioc->lpvOutBuffer, &g_Diag, sizeof(RTW88_DIAG));
+                if (pDioc->lpcbBytesReturned) {
+                    *(PULONG)pDioc->lpcbBytesReturned = sizeof(RTW88_DIAG);
+                }
+                return 0;
+            }
+            return 87; /* ERROR_INVALID_PARAMETER */
+        }
+
+        /* DIOC 2: Pop next outbound Ethernet frame from TX ring */
+        case 2: {
+            UINT frameLen = 0;
+            if (!pDioc->lpvOutBuffer || pDioc->cbOutBuffer < 14) {
+                return 87;
+            }
+            if (g_PktMem) {
+                ULONG irq = RtwIrqSave();
+                if (g_PktMem->TxTail != g_PktMem->TxHead) {
+                    UINT idx = g_PktMem->TxTail;
+                    frameLen = g_PktMem->TxRing[idx].Length;
+                    if (frameLen > pDioc->cbOutBuffer) {
+                        frameLen = pDioc->cbOutBuffer;
+                    }
+                    RtwCopyMem((PVOID)pDioc->lpvOutBuffer, g_PktMem->TxRing[idx].Data, frameLen);
+                    g_PktMem->TxTail = (idx + 1) & (RTW88_TX_SLOTS - 1);
+                    g_Diag.TxDequeued++;
+                }
+                RtwIrqRestore(irq);
+            }
             if (pDioc->lpcbBytesReturned) {
-                *(PULONG)pDioc->lpcbBytesReturned = sizeof(RTW88_DIAG);
+                *(PULONG)pDioc->lpcbBytesReturned = frameLen;
             }
             return 0;
         }
-        return 87; /* ERROR_INVALID_PARAMETER */
+
+        /* DIOC 3: Inject inbound Ethernet frame into NDIS / VTCP.386 */
+        case 3: {
+            UINT frameLen = pDioc->cbInBuffer;
+            UINT i;
+            if (!pDioc->lpvInBuffer || frameLen < 14 || frameLen > RTW88_MAX_PACKET_SIZE) {
+                return 87;
+            }
+            RtwEnsurePktMem();
+            if (!g_PktMem || !g_Adapter.Active) {
+                return 21; /* ERROR_NOT_READY */
+            }
+
+            /* Copy to locked Ring-0 staging buffer before calling NDIS */
+            RtwCopyMem(g_PktMem->RxStaging, (const VOID *)pDioc->lpvInBuffer, frameLen);
+            g_Adapter.FramesRcvGood++;
+            g_Diag.RxInjected++;
+
+            {
+                RTW88_RX_CTX rxCtx;
+                UINT payloadLen = frameLen - 14;
+                rxCtx.Payload    = g_PktMem->RxStaging + 14;
+                rxCtx.PayloadLen = payloadLen;
+
+                for (i = 0; i < RTW88_MAX_OPENS; i++) {
+                    if (g_Adapter.Opens[i].InUse && g_Adapter.Opens[i].NdisBindingContext) {
+                        if (RtwMatchFilter(g_Adapter.Opens[i].PacketFilter,
+                                           g_PktMem->RxStaging,
+                                           g_Adapter.CurrentMac)) {
+                            NDIS_STATUS indStatus = NDIS_STATUS_SUCCESS;
+                            NdisIndicateReceive(
+                                &indStatus,
+                                g_Adapter.Opens[i].NdisBindingContext,
+                                (NDIS_HANDLE)&rxCtx,
+                                g_PktMem->RxStaging,
+                                14,
+                                g_PktMem->RxStaging + 14,
+                                payloadLen,
+                                payloadLen
+                            );
+                            NdisIndicateReceiveComplete(g_Adapter.Opens[i].NdisBindingContext);
+                        }
+                    }
+                }
+            }
+
+            if (pDioc->lpcbBytesReturned) {
+                *(PULONG)pDioc->lpcbBytesReturned = frameLen;
+            }
+            return 0;
+        }
+
+        /* DIOC 4: Set Adapter MAC address (6 bytes) */
+        case 4: {
+            if (!pDioc->lpvInBuffer || pDioc->cbInBuffer < 6) {
+                return 87;
+            }
+            RtwCopyMem(g_PermanentMac, (const VOID *)pDioc->lpvInBuffer, 6);
+            RtwCopyMem(g_Adapter.CurrentMac, (const VOID *)pDioc->lpvInBuffer, 6);
+            if (pDioc->lpcbBytesReturned) {
+                *(PULONG)pDioc->lpcbBytesReturned = 6;
+            }
+            return 0;
+        }
+
+        default:
+            return 50; /* ERROR_NOT_SUPPORTED */
     }
-    return 50; /* ERROR_NOT_SUPPORTED */
 }
 
 /* ---------------------------------------------------------------------------
@@ -525,6 +757,8 @@ NTSTATUS NDIS_API DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
     );
     g_Diag.WrapperHandle = (ULONG)g_MacBlock.NdisWrapperHandle;
 
+    RtwEnsurePktMem();
+
     g_MacBlock.MacCharacteristics.MajorNdisVersion             = 3;
     g_MacBlock.MacCharacteristics.MinorNdisVersion             = 0;
     g_MacBlock.MacCharacteristics.Reserved                     = 0;
@@ -539,7 +773,6 @@ NTSTATUS NDIS_API DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
     g_MacBlock.MacCharacteristics.AddAdapterHandler            = Rtw88AddAdapter;
     g_MacBlock.MacCharacteristics.RemoveAdapterHandler         = Rtw88RemoveAdapter;
 
-    /* Exact Win95 NDIS_STRING_CONST("RTW88") layout: Length=6, MaxLength=6 */
     g_MacBlock.MacCharacteristics.Name.Length        = sizeof(g_MacNameStr);
     g_MacBlock.MacCharacteristics.Name.MaximumLength = sizeof(g_MacNameStr);
     g_MacBlock.MacCharacteristics.Name.Buffer        = (PUCHAR)g_MacNameStr;
@@ -564,7 +797,7 @@ NTSTATUS NDIS_API DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
 }
 
 /* ---------------------------------------------------------------------------
- * AddAdapterHandler - Called by NDIS.VXD for our Plug & Play Net devnode
+ * AddAdapterHandler - Called by NDIS.VXD for our Net devnode
  * --------------------------------------------------------------------------- */
 static NDIS_STATUS NDIS_API Rtw88AddAdapter(
     NDIS_HANDLE MacMacContext,
@@ -576,6 +809,7 @@ static NDIS_STATUS NDIS_API Rtw88AddAdapter(
 
     (void)MacMacContext;
     g_Diag.AddAdapterCalls++;
+    RtwEnsurePktMem();
 
     RtwZeroMem(&g_Adapter, sizeof(g_Adapter));
     RtwCopyMem(g_Adapter.CurrentMac, g_PermanentMac, 6);
@@ -606,7 +840,7 @@ static NDIS_STATUS NDIS_API Rtw88AddAdapter(
 }
 
 /* ---------------------------------------------------------------------------
- * RemoveAdapterHandler & UnloadMacHandler (Safe Hot-Unplug!)
+ * RemoveAdapterHandler & UnloadMacHandler
  * --------------------------------------------------------------------------- */
 static VOID NDIS_API Rtw88RemoveAdapter(NDIS_HANDLE MacAdapterContext) {
     PRTW88_ADAPTER adapter = (PRTW88_ADAPTER)MacAdapterContext;
@@ -626,6 +860,11 @@ static VOID NDIS_API Rtw88Unload(NDIS_HANDLE MacMacContext) {
     if (g_MacBlock.NdisMacHandle) {
         NdisDeregisterMac(&status, g_MacBlock.NdisMacHandle);
         g_MacBlock.NdisMacHandle = NULL;
+    }
+    if (g_PktMem) {
+        NdisFreeMemory(g_PktMem, sizeof(RTW88_PKTMEM), 0);
+        g_PktMem = NULL;
+        g_Diag.PktMemAddr = 0;
     }
     if (g_MacBlock.NdisWrapperHandle) {
         NdisTerminateWrapper(g_MacBlock.NdisWrapperHandle, NULL);
@@ -696,6 +935,7 @@ static NDIS_STATUS NDIS_API Rtw88OpenAdapter(
     openSlot->LookAhead          = RTW88_MAX_LOOKAHEAD;
     openSlot->ProtocolOptions    = 0;
 
+    g_Diag.OpenAdapterCalls++;
     *MacBindingHandle = (NDIS_HANDLE)openSlot;
     return NDIS_STATUS_SUCCESS;
 }
@@ -705,28 +945,78 @@ static NDIS_STATUS NDIS_API Rtw88CloseAdapter(NDIS_HANDLE MacBindingHandle) {
     if (openSlot) {
         openSlot->InUse = FALSE;
         openSlot->Adapter = NULL;
+        openSlot->NdisBindingContext = NULL;
     }
     return NDIS_STATUS_SUCCESS;
 }
 
 /* ---------------------------------------------------------------------------
- * Send / TransferData / Reset
+ * Send - Flattens NDIS_PACKET into Ring-0 TX ring buffer for DIOC 2 (POP_TX)
  * --------------------------------------------------------------------------- */
 static NDIS_STATUS NDIS_API Rtw88Send(
     NDIS_HANDLE MacBindingHandle,
     PNDIS_PACKET Packet)
 {
     PRTW88_OPEN openSlot = (PRTW88_OPEN)MacBindingHandle;
-    (void)Packet;
+    PNDIS_BUFFER curBuf = NULL;
+    UINT totalLen = 0;
 
-    if (!openSlot || !openSlot->Adapter) {
+    if (!openSlot || !openSlot->Adapter || !Packet) {
         return NDIS_STATUS_FAILURE;
     }
 
     openSlot->Adapter->FramesXmitGood++;
+
+    if (!g_PktMem) {
+        g_Diag.TxDropped++;
+        return NDIS_STATUS_SUCCESS;
+    }
+
+    NdisQueryPacket(Packet, NULL, NULL, &curBuf, &totalLen);
+    if (totalLen < 14 || totalLen > RTW88_MAX_PACKET_SIZE || !curBuf) {
+        g_Diag.TxDropped++;
+        return NDIS_STATUS_SUCCESS;
+    }
+
+    {
+        ULONG irq = RtwIrqSave();
+        UINT nextHead = (g_PktMem->TxHead + 1) & (RTW88_TX_SLOTS - 1);
+        if (nextHead == g_PktMem->TxTail) {
+            /* Ring full — drop oldest or drop this packet */
+            g_Diag.TxDropped++;
+            RtwIrqRestore(irq);
+            return NDIS_STATUS_SUCCESS;
+        }
+        {
+            UCHAR *dst = g_PktMem->TxRing[g_PktMem->TxHead].Data;
+            UINT copied = 0;
+            while (curBuf && copied < totalLen) {
+                PVOID va = NULL;
+                UINT blen = 0;
+                NdisQueryBuffer(curBuf, &va, &blen);
+                if (va && blen > 0) {
+                    UINT toCopy = blen;
+                    if (copied + toCopy > totalLen) {
+                        toCopy = totalLen - copied;
+                    }
+                    RtwCopyMem(dst + copied, va, toCopy);
+                    copied += toCopy;
+                }
+                NdisGetNextBuffer(curBuf, &curBuf);
+            }
+            g_PktMem->TxRing[g_PktMem->TxHead].Length = copied;
+            g_PktMem->TxHead = nextHead;
+            g_Diag.TxEnqueued++;
+        }
+        RtwIrqRestore(irq);
+    }
+
     return NDIS_STATUS_SUCCESS;
 }
 
+/* ---------------------------------------------------------------------------
+ * TransferData - Copies RX payload into protocol's NDIS_PACKET chain
+ * --------------------------------------------------------------------------- */
 static NDIS_STATUS NDIS_API Rtw88TransferData(
     NDIS_HANDLE MacBindingHandle,
     NDIS_HANDLE MacReceiveContext,
@@ -735,14 +1025,47 @@ static NDIS_STATUS NDIS_API Rtw88TransferData(
     PNDIS_PACKET Packet,
     PUINT BytesTransferred)
 {
+    PRTW88_RX_CTX rxCtx = (PRTW88_RX_CTX)MacReceiveContext;
+    PNDIS_BUFFER curBuf = NULL;
+    UINT copied = 0;
+    UINT avail;
+
     (void)MacBindingHandle;
-    (void)MacReceiveContext;
-    (void)BytesOffset;
-    (void)BytesToTransfer;
-    (void)Packet;
+    g_Diag.TransferDataCalls++;
 
     if (BytesTransferred) {
         *BytesTransferred = 0;
+    }
+    if (!rxCtx || !rxCtx->Payload || !Packet) {
+        return NDIS_STATUS_FAILURE;
+    }
+    if (BytesOffset >= rxCtx->PayloadLen) {
+        return NDIS_STATUS_SUCCESS;
+    }
+
+    avail = rxCtx->PayloadLen - BytesOffset;
+    if (BytesToTransfer > avail) {
+        BytesToTransfer = avail;
+    }
+
+    NdisQueryPacket(Packet, NULL, NULL, &curBuf, NULL);
+    while (curBuf && copied < BytesToTransfer) {
+        PVOID va = NULL;
+        UINT blen = 0;
+        NdisQueryBuffer(curBuf, &va, &blen);
+        if (va && blen > 0) {
+            UINT toCopy = blen;
+            if (copied + toCopy > BytesToTransfer) {
+                toCopy = BytesToTransfer - copied;
+            }
+            RtwCopyMem(va, rxCtx->Payload + BytesOffset + copied, toCopy);
+            copied += toCopy;
+        }
+        NdisGetNextBuffer(curBuf, &curBuf);
+    }
+
+    if (BytesTransferred) {
+        *BytesTransferred = copied;
     }
     return NDIS_STATUS_SUCCESS;
 }
@@ -760,8 +1083,8 @@ static NDIS_STATUS Rtw88HandleQuery(
     PRTW88_OPEN openSlot,
     PNDIS_REQUEST req)
 {
-    NDIS_OID oid   = req->DATA.QUERY_INFORMATION.Oid;
-    PVOID    buf   = req->DATA.QUERY_INFORMATION.InformationBuffer;
+    NDIS_OID oid    = req->DATA.QUERY_INFORMATION.Oid;
+    PVOID    buf    = req->DATA.QUERY_INFORMATION.InformationBuffer;
     UINT     buflen = req->DATA.QUERY_INFORMATION.InformationBufferLength;
 
     ULONG  uLongVal  = 0;
@@ -792,13 +1115,9 @@ static NDIS_STATUS Rtw88HandleQuery(
             break;
 
         case OID_GEN_CURRENT_LOOKAHEAD:
-            if (openSlot) {
-                uLongVal = openSlot->LookAhead;
-            } else if (adapter) {
-                uLongVal = adapter->LookAhead;
-            } else {
-                uLongVal = RTW88_MAX_LOOKAHEAD;
-            }
+            if (openSlot) uLongVal = openSlot->LookAhead;
+            else if (adapter) uLongVal = adapter->LookAhead;
+            else uLongVal = RTW88_MAX_LOOKAHEAD;
             break;
 
         case OID_GEN_MAXIMUM_FRAME_SIZE:
@@ -839,11 +1158,8 @@ static NDIS_STATUS Rtw88HandleQuery(
             break;
 
         case OID_GEN_CURRENT_PACKET_FILTER:
-            if (openSlot) {
-                uLongVal = openSlot->PacketFilter;
-            } else if (adapter) {
-                uLongVal = adapter->PacketFilter;
-            }
+            if (openSlot) uLongVal = openSlot->PacketFilter;
+            else if (adapter) uLongVal = adapter->PacketFilter;
             break;
 
         case OID_GEN_PROTOCOL_OPTIONS:
@@ -1009,4 +1325,3 @@ static NDIS_STATUS NDIS_API Rtw88QueryGlobalStatistics(
     }
     return Rtw88HandleQuery(adapter ? adapter : &g_Adapter, NULL, NdisRequest);
 }
-

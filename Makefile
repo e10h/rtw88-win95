@@ -8,7 +8,10 @@ VXD_CFLAGS = -O2 -march=pentium-mmx -mtune=pentium-mmx -mno-stack-arg-probe \
 JWASM ?= /Users/ethan/.gemini/antigravity/brain/8dbb8657-600c-4d8e-9f0c-ae28412df3dc/scratch/tools/jwasm_bin
 JWLINK ?= /Users/ethan/.gemini/antigravity/brain/8dbb8657-600c-4d8e-9f0c-ae28412df3dc/scratch/tools/jwlink_bin
 
-all: RTWPROBE.SYS RTWTEST.EXE AUTOBIND.EXE RTWSCAN.EXE RTW88.VXD TESTVXD.VXD VXDDIAG.EXE
+all: RTWPROBE.SYS RTWTEST.EXE AUTOBIND.EXE RTWSCAN.EXE RTW88.VXD TESTVXD.VXD VXDDIAG.EXE PINGTEST.EXE
+
+PINGTEST.EXE: pingtest.c
+	$(CC) $(CFLAGS) -nostdlib -e _mainCRTStartup -Wl,--subsystem,console -o $@ $< -lkernel32 -luser32
 
 TESTVXD.VXD: testvxd.asm testvxd.lnk fixvxd.py
 	$(JWASM) -coff -Cx -Fo testvxd.obj testvxd.asm
