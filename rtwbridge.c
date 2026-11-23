@@ -135,6 +135,8 @@ static HANDLE           g_hDevTx  = INVALID_HANDLE_VALUE;
 static HANDLE           g_hVxd    = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_Lock;
 static CRITICAL_SECTION g_PrintLock;
+static CRITICAL_SECTION g_VxdLock;
+static CRITICAL_SECTION g_TxLock;
 static volatile int     g_Running = 1;
 static u8               g_ForceCh = 0;
 
@@ -661,7 +663,8 @@ static int RtwMacInit(void) {
         vo=2; vi=2; be=1; bk=1; mg=0; hi=3; hq=64; lq=64; nq=64; exq=64; gapq=1;
     }
     g_MgmtPipeIdx = DmaMapToPipe(mg);
-    g_DataPipeIdx = DmaMapToPipe(be);
+    /* Route Data frames through the same proven HIGH/MGMT Bulk OUT pipe (Pipe 0) */
+    g_DataPipeIdx = g_MgmtPipeIdx;
 
     u16 pqMap = (u16)((vo << 4) | (vi << 6) | (be << 8) | (bk << 10) | (mg << 12) | (hi << 14));
     RegWrite16(0x010C, pqMap);
@@ -924,23 +927,26 @@ static int RtwSend80211(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
     int isBmc = (frame[4] & 1) ? 1 : 0;
     u16 seq = (u16)((frame[22] | ((u16)frame[23] << 8)) >> 4);
 
+    EnterCriticalSection(&g_TxLock);
     c_zero(txBuf->Data, 48);
     u32 *dw = (u32 *)txBuf->Data;
 
-    u32 qsel   = isMgmt ? 18U : 0U;   /* TX_DESC_QSEL_MGMT=18, TID0(BE)=0 */
-    u32 rateId = isMgmt ? 8U  : 6U;   /* B_20M=8, BG=6 */
-    u32 rate   = isMgmt ? 0U  : 3U;   /* 1 Mbps for mgmt, 11 Mbps CCK (with fallback) for data */
+    /* Use proven MGMT queue (QSEL=18, Pipe 0, DISDATAFB=1, EN_HWSEQ=1) for ALL frames!
+     * IEEE 802.11i CCMP AAD masks out Sequence Number (bits 15:4), so EN_HWSEQ=1 is 100% CCMP-safe.
+     * Mgmt/EAPOL use 1 Mbps CCK (rate=0); Data uses 11 Mbps CCK (rate=3). */
+    u32 qsel   = 18U;                  /* TX_DESC_QSEL_MGMT (proven on Auth/Assoc/M2/M4!) */
+    u32 rateId = 8U;                   /* RTW_RATEID_B_20M */
+    u32 rate   = isMgmt ? 0U : 3U;     /* 1 Mbps for mgmt/EAPOL, 11 Mbps CCK for Data */
 
     dw[0] = (frameLen & 0xFFFFU) | (48U << 16) |
-            (isBmc ? (1U << 24) : 0U) | (1U << 26) |
-            (isMgmt ? (1U << 31) : 0U);
+            (isBmc ? (1U << 24) : 0U) | (1U << 26) | (1U << 31); /* LS=1 | DISQSELSEQ=1 */
     dw[1] = (qsel << 8) | (rateId << 16);
     dw[2] = 0;
-    dw[3] = (1U << 8) | (isMgmt ? (1U << 10) : 0U); /* USE_RATE=1; allow rate fallback on data */
+    dw[3] = (1U << 8) | (1U << 10);    /* USE_RATE=1 | DISDATAFB=1 (no FW RA needed!) */
     dw[4] = rate;
     dw[5] = 0; /* BW20 */
     dw[6] = 0;
-    dw[8] = isMgmt ? (1U << 15) : 0U; /* EN_HWSEQ for mgmt */
+    dw[8] = (1U << 15);                /* EN_HWSEQ=1 */
     dw[9] = ((u32)(seq & 0xFFF) << 12);
     dw[7] = CalcTxDescChecksum(txBuf->Data);
 
@@ -953,12 +959,14 @@ static int RtwSend80211(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
         totalLen += 1;
     }
 
-    txBuf->OutPipeIdx = isMgmt ? g_MgmtPipeIdx : g_DataPipeIdx;
+    txBuf->OutPipeIdx = g_MgmtPipeIdx;
     txBuf->Length     = totalLen;
 
     DWORD br = 0;
-    return DeviceIoControl(hOutDev, IOCTL_RTW_BULK_TX_PIPE,
-                           txBuf, 8 + totalLen, NULL, 0, &br, NULL) ? 1 : 0;
+    int ok = DeviceIoControl(hOutDev, IOCTL_RTW_BULK_TX_PIPE,
+                             txBuf, 8 + totalLen, NULL, 0, &br, NULL) ? 1 : 0;
+    LeaveCriticalSection(&g_TxLock);
+    return ok;
 }
 
 static u16 NextSeq(void) {
@@ -1306,8 +1314,13 @@ static DWORD WINAPI TxBridgeThread(LPVOID param) {
 
     while (g_Running) {
         DWORD txLen = 0;
-        BOOL popped = DeviceIoControl(g_hVxd, RTW88_DIOC_POP_TX,
-                                      NULL, 0, g_EthTxBuf, sizeof(g_EthTxBuf), &txLen, NULL);
+        BOOL popped = FALSE;
+        if (g_hVxd != INVALID_HANDLE_VALUE) {
+            EnterCriticalSection(&g_VxdLock);
+            popped = DeviceIoControl(g_hVxd, RTW88_DIOC_POP_TX,
+                                     NULL, 0, g_EthTxBuf, sizeof(g_EthTxBuf), &txLen, NULL);
+            LeaveCriticalSection(&g_VxdLock);
+        }
         if (!popped || txLen < 14 || txLen > 1518) {
             DWORD now = GetTickCount();
             if ((now - lastKeepalive) >= 12000) {
@@ -1362,6 +1375,8 @@ static DWORD WINAPI TxBridgeThread(LPVOID param) {
         if (RtwSend80211(g_hDevTx, &g_TxWorker, f, 24 + bodyLen, 0)) {
             g_StatTxEth++;
             LogEthSummary("[TX]", g_EthTxBuf, txLen);
+        } else {
+            Print("[TX USB FAIL] err="); PrintDec(GetLastError()); Print("\r\n");
         }
         lastKeepalive = GetTickCount();
     }
@@ -1564,7 +1579,9 @@ static void BridgeRxCb(const u8 *f, u32 len, void *vctx) {
 
     if (g_hVxd != INVALID_HANDLE_VALUE) {
         DWORD br = 0;
+        EnterCriticalSection(&g_VxdLock);
         DeviceIoControl(g_hVxd, RTW88_DIOC_INJECT_RX, g_EthRxBuf, ethLen, NULL, 0, &br, NULL);
+        LeaveCriticalSection(&g_VxdLock);
     }
     g_StatRxEth++;
     LogEthSummary("[RX]", g_EthRxBuf, ethLen);
@@ -1651,6 +1668,8 @@ static int LoadConfig(void) {
 void mainCRTStartup(void) {
     InitializeCriticalSection(&g_Lock);
     InitializeCriticalSection(&g_PrintLock);
+    InitializeCriticalSection(&g_VxdLock);
+    InitializeCriticalSection(&g_TxLock);
 
     Print("=========================================================\r\n");
     Print("  RTL8822BU Win95 Wi-Fi Bridge (Open + WPA2-PSK CCMP)\r\n");
@@ -1670,8 +1689,8 @@ void mainCRTStartup(void) {
     if (g_PasswordLen > 0) Print(" (WPA2-PSK)\r\n");
     else Print(" (OPEN)\r\n");
 
-    /* 1. Open RTW88.VXD & grab VTCP.386's exact MAC address */
-    g_hVxd = CreateFileA("\\\\.\\RTW88.VXD", 0, 0, NULL, 0, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    /* 1. Open RTW88.VXD (without DELETE_ON_CLOSE!) & grab VTCP.386's exact MAC */
+    g_hVxd = CreateFileA("\\\\.\\RTW88.VXD", 0, 0, NULL, 0, 0, NULL);
     if (g_hVxd != INVALID_HANDLE_VALUE) {
         RTW88_DIAG diag;
         DWORD br = 0;
@@ -1861,10 +1880,24 @@ void mainCRTStartup(void) {
     while (g_Running) {
         PollRxBatch(BridgeRxCb, NULL);
         DWORD now = GetTickCount();
-        if ((now - lastStat) >= 15000) {
+        if ((now - lastStat) >= 10000) {
             lastStat = now;
+            DWORD vxdTxQ = 0, vxdRxInj = 0;
+            if (g_hVxd != INVALID_HANDLE_VALUE) {
+                RTW88_DIAG d;
+                DWORD cb = 0;
+                c_zero(&d, sizeof(d));
+                EnterCriticalSection(&g_VxdLock);
+                if (DeviceIoControl(g_hVxd, RTW88_DIOC_GET_DIAG, NULL, 0, &d, sizeof(d), &cb, NULL)) {
+                    vxdTxQ = d.TxEnqueued;
+                    vxdRxInj = d.RxInjected;
+                }
+                LeaveCriticalSection(&g_VxdLock);
+            }
             Print("[STAT] TX="); PrintDec(g_StatTxEth);
             Print(" RX="); PrintDec(g_StatRxEth);
+            Print(" VxdTx="); PrintDec(vxdTxQ);
+            Print(" VxdRx="); PrintDec(vxdRxInj);
             Print(" BCN="); PrintDec(g_StatRxBcn);
             Print(" DecFail="); PrintDec(g_StatDecFail); Print("\r\n");
             SaveLog();
