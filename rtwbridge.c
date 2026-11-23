@@ -570,7 +570,7 @@ static int RtwMacPowerOn(void) {
     int r = PowerSwitch(1);
     if (r == -1) {
         PowerSwitch(0);
-        Sleep(10);
+        Sleep(50);
         PreSysCfg();
         r = PowerSwitch(1);
     }
@@ -1944,7 +1944,15 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
     g_CutVer = (u8)((RegRead32(0x00F0) >> 12) & 0xF);
     ReadEfuse();
     if (!RtwMacPowerOn()) { SetStatus("FATAL: Radio PowerOn failed!"); Print("  [FATAL] PowerOn failed\r\n"); SaveLog(); return 1; }
-    if (!RtwDownloadFirmware()) { Print("  [WARN] FW boot timeout\r\n"); }
+    if (!RtwDownloadFirmware()) {
+        Print("  [INFO] Retrying FW download after clean power-cycle...\r\n");
+        PowerSwitch(0);
+        Sleep(100);
+        RtwMacPowerOn();
+        if (!RtwDownloadFirmware()) {
+            Print("  [WARN] FW boot timeout\r\n");
+        }
+    }
     if (!RtwMacInit()) { SetStatus("FATAL: MacInit failed!"); Print("  [FATAL] MacInit failed\r\n"); SaveLog(); return 1; }
     RtwPhySetParam();
     Print("  Radio UP! Cut="); PrintDec(g_CutVer); Print(" RFE="); PrintDec(g_RfeOpt);
@@ -2104,6 +2112,9 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
     Print("=========================================================\r\n\r\n");
     SaveLog();
 
+    /* Boost worker thread slightly only during active packet bridging (after init!) */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
     /* Single-threaded TX/RX bridge loop on g_hDev (zero USB contention!) */
     DWORD lastStat = GetTickCount();
     DWORD lastKeepalive = GetTickCount();
@@ -2255,8 +2266,8 @@ void WinMainCRTStartup(void) {
     InitializeCriticalSection(&g_VxdLock);
     InitializeCriticalSection(&g_TxLock);
 
-    /* Ensure Windows 95 NEVER throttles Wi-Fi bridging while IE or DOS is focused! */
-    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    /* Keep NORMAL_PRIORITY_CLASS so Win95 USB/UI threads are never starved;
+     * native --subsystem,windows apps are never suspended in the background! */
 
     HINSTANCE hInst = GetModuleHandleA(NULL);
     WNDCLASSA wc;
@@ -2279,10 +2290,8 @@ void WinMainCRTStartup(void) {
     UpdateWindow(g_hWnd);
 
     DWORD tid = 0;
-    HANDLE hWorker = CreateThread(NULL, 0, BridgeWorkerThread, NULL, 0, &tid);
-    if (hWorker) {
-        SetThreadPriority(hWorker, THREAD_PRIORITY_ABOVE_NORMAL);
-    }
+    /* Commit 256 KB stack upfront so worker thread never hits a 4 KB guard page */
+    CreateThread(NULL, 0x40000, BridgeWorkerThread, NULL, 0, &tid);
 
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
