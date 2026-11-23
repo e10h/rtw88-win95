@@ -113,6 +113,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     InstallAndCheck(sysDir, "TESTVXD.VXD");
     InstallAndCheck(sysDir, "RTW88.VXD");
 
+    /* Test 0: Positive control — built-in VWIN32 */
+    AppStr("\r\n[Test 0: \\\\.\\VWIN32 (built-in control)]\r\n");
+    HANDLE hCtrl = CreateFileA("\\\\.\\VWIN32", 0, 0, NULL, 0, 0, NULL);
+    if (hCtrl == INVALID_HANDLE_VALUE) {
+        AppStr("  FAILED err="); AppDec(GetLastError()); AppStr("\r\n");
+    } else {
+        AppStr("  OPENED OK!\r\n");
+        CloseHandle(hCtrl);
+    }
+
     /* Test 1: Minimal bare VxD (zero NDIS calls) */
     AppStr("\r\n[Test 1: \\\\.\\TESTVXD.VXD (bare LE VxD)]\r\n");
     HANDLE hTest = CreateFileA("\\\\.\\TESTVXD.VXD", 0, 0, NULL, 0, FILE_FLAG_DELETE_ON_CLOSE, NULL);

@@ -2,10 +2,8 @@ format windows vxd dynamic
 name TESTVXD.VXD
 option modname='TESTVXD'
 option description 'Minimal Win95 Dynamic VxD Loader Test'
-option version=4.0
 option nodefaultlibs
 option caseexact
-segment '_LDATA' preload nondiscardable
 segment '_LTEXT' preload nondiscardable
 file testvxd.obj
 export TESTVXD_DDB.1

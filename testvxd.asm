@@ -1,11 +1,15 @@
-; testvxd.asm - Minimal 1-object Win95 dynamic VxD to verify VXDLDR + JWlink LE format
+; testvxd.asm - Minimal 1-object Win95 dynamic VxD (matches ELNK3.VXD layout 100%)
     .386P
 
-_LDATA SEGMENT DWORD PUBLIC USE32 'DATA'
+; Both DDB and Control proc live in ONE locked CODE object (Obj 1, 0x00002045)
+; matching Microsoft LINK.EXE -VXD / ELNK3.VXD / SWAPCOMP.VXD / AHCIFIX.386!
+_LTEXT SEGMENT DWORD PUBLIC USE32 'CODE'
+    ASSUME CS:FLAT, DS:FLAT, ES:FLAT, SS:FLAT
+
 PUBLIC TESTVXD_DDB
 TESTVXD_DDB LABEL BYTE
     dd 0                        ; DDB_Next
-    dw 0400h                    ; DDB_SDK_Version
+    dw 030Ah                    ; DDB_SDK_Version (3.10, exact match to ELNK3.VXD)
     dw 0000h                    ; DDB_Req_Device_Number
     db 1                        ; Major
     db 0                        ; Minor
@@ -19,10 +23,6 @@ TESTVXD_DDB LABEL BYTE
     dd 'Rsv1'
     dd 'Rsv2'
     dd 'Rsv3'
-_LDATA ENDS
-
-_LTEXT SEGMENT DWORD PUBLIC USE32 'CODE'
-    ASSUME CS:FLAT, DS:FLAT, ES:FLAT, SS:FLAT
 
 PUBLIC TESTVXD_Control
 TESTVXD_Control PROC NEAR

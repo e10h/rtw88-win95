@@ -2,11 +2,9 @@ format windows vxd dynamic
 name RTW88.VXD
 option modname='RTW88'
 option description 'Realtek RTL8822BU Wireless LAN NDIS 3.1 VxD'
-option version=4.0
 option map=RTW88.MAP
 option nodefaultlibs
 option caseexact
-segment '_LDATA' preload nondiscardable
 segment '_LTEXT' preload nondiscardable
 segment '.text'  preload nondiscardable
 segment '.data'  preload nondiscardable

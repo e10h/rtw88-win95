@@ -1,11 +1,10 @@
 ;=============================================================================
 ; rtw88vxd.asm - Windows 95 Native LE VxD Shell for RTW88 NDIS 3.x MAC Driver
-; Equivalent to Microsoft Win95 DDK ndis3\src\ndisdev.asm (MAC=RTW88, CHICAGO)
-; Includes W32_DEVICEIOCONTROL handler for VXDDIAG.EXE live diagnostics.
+; Matches Microsoft Win95 DDK ELNK3.VXD layout: DDB + code in 1 locked LCODE obj
 ;=============================================================================
     .386P
 
-DDK_VERSION             EQU 0400h
+DDK_VERSION             EQU 030Ah       ; Exact match to Win95 DDK ndis.mk (-DWIN31COMPAT) & ELNK3.VXD
 UNDEFINED_DEVICE_ID     EQU 0000h
 MAC_INIT_ORDER          EQU 54004000h   ; VNETBIOS (54000000h) + NDIS (2000h) + MAC (2000h)
 
@@ -17,15 +16,16 @@ W32_DEVICEIOCONTROL     EQU 0023h
 NDIS_GETVERSION_SVC     EQU 00280000h   ; VxD 0028h (NDIS), Service 0000h (NdisGetVersion)
 
 ;-----------------------------------------------------------------------------
-; Locked Data Segment (_LDATA, class DATA -> READ|WRITE|PRELOAD|BIG/32BIT)
-; RTW88_DDB MUST be at offset 0 of _LDATA so jwlink SetHeaderVxDInfo reads it.
+; Single Locked Code+Data Segment (_LTEXT, class CODE -> Obj 1 = 0x00002045)
+; RTW88_DDB MUST be at offset 0 of _LTEXT so jwlink SetHeaderVxDInfo reads it.
 ;-----------------------------------------------------------------------------
-_LDATA SEGMENT DWORD PUBLIC USE32 'DATA'
+_LTEXT SEGMENT DWORD PUBLIC USE32 'CODE'
+    ASSUME CS:FLAT, DS:FLAT, ES:FLAT, SS:FLAT
 
 PUBLIC RTW88_DDB
 RTW88_DDB LABEL BYTE
     dd 0                        ; +00 DDB_Next
-    dw DDK_VERSION              ; +04 DDB_SDK_Version (0400h = Win95)
+    dw DDK_VERSION              ; +04 DDB_SDK_Version (030Ah)
     dw UNDEFINED_DEVICE_ID      ; +06 DDB_Req_Device_Number (0)
     db 3                        ; +08 DDB_Dev_Major_Version
     db 10                       ; +09 DDB_Dev_Minor_Version
@@ -56,14 +56,6 @@ _g_VxdNdisVer       dd 0
 PUBLIC bInitAlready
 bInitAlready        db 0
                     db 0, 0, 0
-
-_LDATA ENDS
-
-;-----------------------------------------------------------------------------
-; Locked Code Segment (_LTEXT, class CODE -> READ|EXEC|PRELOAD|BIG/32BIT)
-;-----------------------------------------------------------------------------
-_LTEXT SEGMENT DWORD PUBLIC USE32 'CODE'
-    ASSUME CS:FLAT, DS:FLAT, ES:FLAT, SS:FLAT
 
 EXTERN _DriverEntry@8:NEAR
 EXTERN _Rtw88DeviceIoControl@4:NEAR
