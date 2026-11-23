@@ -52,6 +52,58 @@
 #define IOCTL_RTW_BULK_RX           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RTW_BULK_TX           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+/* Milestone 7 Generic Hardware Access IOCTLs (keeps RTWPROBE.SYS permanently stable!) */
+#define IOCTL_RTW_REG_READ          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x820, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RTW_REG_WRITE         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RTW_REG_BATCH         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x822, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RTW_BULK_RX_RAW       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x823, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RTW_BULK_TX_PIPE      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RTW_GET_PIPES         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define RTW_OP_WRITE                0
+#define RTW_OP_MASK                 1
+#define RTW_OP_POLL                 2
+#define RTW_OP_RF_WRITE             3
+#define RTW_OP_DELAY_READS          4
+
+typedef struct _RTW_REG_REQ {
+    USHORT Addr;
+    USHORT Width;       /* 1, 2, or 4 */
+    ULONG  Value;
+    LONG   Status;
+} RTW_REG_REQ, *PRTW_REG_REQ;
+
+typedef struct _RTW_REG_OP {
+    UCHAR  Op;          /* RTW_OP_* */
+    UCHAR  Width;       /* 1/2/4 or RF path (0=A, 1=B) */
+    USHORT Addr;
+    ULONG  Mask;
+    ULONG  Value;
+} RTW_REG_OP, *PRTW_REG_OP;
+
+typedef struct _RTW_REG_BATCH {
+    ULONG      Count;   /* up to 256 */
+    RTW_REG_OP Ops[256];
+} RTW_REG_BATCH, *PRTW_REG_BATCH;
+
+typedef struct _RTW_BULK_RX_REQ {
+    ULONG CheckFifo;    /* 1 = check REG_RXPKTNUM first, 0 = read immediately */
+    ULONG MaxLen;
+} RTW_BULK_RX_REQ, *PRTW_BULK_RX_REQ;
+
+typedef struct _RTW_BULK_RX_RAW {
+    LONG  Status;
+    ULONG Length;
+    ULONG RxPktNum;
+    UCHAR Data[4096];
+} RTW_BULK_RX_RAW, *PRTW_BULK_RX_RAW;
+
+typedef struct _RTW_BULK_TX_PIPE {
+    ULONG OutPipeIdx;   /* 0=HI, 1=NORM, 2=LOW, 3=EXTRA */
+    ULONG Length;
+    UCHAR Data[4200];
+} RTW_BULK_TX_PIPE, *PRTW_BULK_TX_PIPE;
+
 #define REG_CR                      0x0100
 #define REG_RCR                     0x0608
 #define REG_RXPKTNUM                0x02B0
@@ -74,6 +126,15 @@ typedef struct _RTW_PIPE_INFO {
     UCHAR PipeType;
     USHORT MaxPacketSize;
 } RTW_PIPE_INFO;
+
+typedef struct _RTW_PIPES_RESP {
+    ULONG         NumPipes;
+    ULONG         NumBulkOut;
+    UCHAR         BulkInAddr;
+    UCHAR         BulkOutAddrs[4];
+    UCHAR         Reserved[3];
+    RTW_PIPE_INFO Pipes[8];
+} RTW_PIPES_RESP, *PRTW_PIPES_RESP;
 
 typedef struct _RTW_PROBE_DATA {
     USHORT func_en;
@@ -144,6 +205,59 @@ static void MyMemCpy(void *dst, const void *src, unsigned long len) {
 static PDEVICE_EXTENSION g_pDevExt = NULL;
 
 /* -------------------------------------------------------------
+   USB Control Transfer Vendor Write (Raw - no 0x04E0 erratum)
+------------------------------------------------------------- */
+static NTSTATUS RTW_UsbWriteRegRaw(PDEVICE_OBJECT LowerDevice, USHORT addr, PVOID buffer, ULONG len) {
+    KEVENT event;
+    IO_STATUS_BLOCK ioStatus;
+    PIRP irp;
+    PIO_STACK_LOCATION nextStack;
+    struct _URB_CONTROL_VENDOR_OR_CLASS_REQUEST urb;
+    NTSTATUS status;
+
+    RtlZeroMemory(&urb, sizeof(urb));
+    urb.Hdr.Length = sizeof(urb);
+    urb.Hdr.Function = URB_FUNCTION_VENDOR_DEVICE;
+    urb.TransferFlags = 0; /* Host to Device (OUT) */
+    urb.Request = RTW_USB_CMD_REQ;
+    urb.Value = addr;
+    urb.Index = 0x0000;
+    urb.TransferBufferLength = len;
+    urb.TransferBuffer = buffer;
+
+    KeInitializeEvent(&event, NotificationEvent, FALSE);
+
+    irp = IoBuildDeviceIoControlRequest(
+        IOCTL_INTERNAL_USB_SUBMIT_URB,
+        LowerDevice,
+        NULL, 0, NULL, 0,
+        TRUE, &event, &ioStatus
+    );
+
+    if (!irp) return STATUS_INSUFFICIENT_RESOURCES;
+
+    nextStack = IoGetNextIrpStackLocation(irp);
+    nextStack->Parameters.Others.Argument1 = &urb;
+
+    status = IoCallDriver(LowerDevice, irp);
+    if (status == STATUS_PENDING) {
+        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+        status = ioStatus.Status;
+    }
+
+    return status;
+}
+
+/* RTL8822BU USB silicon erratum (Linux rtw88/usb.c rtw_usb_reg_sec):
+ * After any access to the always-on section (0x00..0xFF or 0x1000..0x10FF),
+ * write 1 byte to 0x04E0 so the USB register bridge does not stall. */
+static void RTW_UsbRegSec(PDEVICE_OBJECT LowerDevice, USHORT addr, UCHAR byte0) {
+    if (addr <= 0x00FF || (addr >= 0x1000 && addr <= 0x10FF)) {
+        RTW_UsbWriteRegRaw(LowerDevice, 0x04E0, &byte0, 1);
+    }
+}
+
+/* -------------------------------------------------------------
    USB Control Transfer Vendor Read (bRequest = 0x05, IN)
 ------------------------------------------------------------- */
 static NTSTATUS RTW_UsbReadReg(PDEVICE_OBJECT LowerDevice, USHORT addr, PVOID buffer, ULONG len) {
@@ -184,6 +298,10 @@ static NTSTATUS RTW_UsbReadReg(PDEVICE_OBJECT LowerDevice, USHORT addr, PVOID bu
         status = ioStatus.Status;
     }
 
+    if (NT_SUCCESS(status) && len > 0) {
+        RTW_UsbRegSec(LowerDevice, addr, ((PUCHAR)buffer)[0]);
+    }
+
     return status;
 }
 
@@ -191,43 +309,10 @@ static NTSTATUS RTW_UsbReadReg(PDEVICE_OBJECT LowerDevice, USHORT addr, PVOID bu
    USB Control Transfer Vendor Write (bRequest = 0x05, OUT)
 ------------------------------------------------------------- */
 static NTSTATUS RTW_UsbWriteReg(PDEVICE_OBJECT LowerDevice, USHORT addr, PVOID buffer, ULONG len) {
-    KEVENT event;
-    IO_STATUS_BLOCK ioStatus;
-    PIRP irp;
-    PIO_STACK_LOCATION nextStack;
-    struct _URB_CONTROL_VENDOR_OR_CLASS_REQUEST urb;
-    NTSTATUS status;
-
-    RtlZeroMemory(&urb, sizeof(urb));
-    urb.Hdr.Length = sizeof(urb);
-    urb.Hdr.Function = URB_FUNCTION_VENDOR_DEVICE;
-    urb.TransferFlags = 0; /* Host to Device (OUT) */
-    urb.Request = RTW_USB_CMD_REQ;
-    urb.Value = addr;
-    urb.Index = 0x0000;
-    urb.TransferBufferLength = len;
-    urb.TransferBuffer = buffer;
-
-    KeInitializeEvent(&event, NotificationEvent, FALSE);
-
-    irp = IoBuildDeviceIoControlRequest(
-        IOCTL_INTERNAL_USB_SUBMIT_URB,
-        LowerDevice,
-        NULL, 0, NULL, 0,
-        TRUE, &event, &ioStatus
-    );
-
-    if (!irp) return STATUS_INSUFFICIENT_RESOURCES;
-
-    nextStack = IoGetNextIrpStackLocation(irp);
-    nextStack->Parameters.Others.Argument1 = &urb;
-
-    status = IoCallDriver(LowerDevice, irp);
-    if (status == STATUS_PENDING) {
-        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
-        status = ioStatus.Status;
+    NTSTATUS status = RTW_UsbWriteRegRaw(LowerDevice, addr, buffer, len);
+    if (NT_SUCCESS(status) && len > 0) {
+        RTW_UsbRegSec(LowerDevice, addr, ((PUCHAR)buffer)[0]);
     }
-
     return status;
 }
 
@@ -482,6 +567,67 @@ static USBD_PIPE_HANDLE RTW_FindBulkOutPipe(PDEVICE_EXTENSION pDevExt) {
         }
     }
     return NULL;
+}
+
+static USBD_PIPE_HANDLE RTW_FindBulkOutPipeByIndex(PDEVICE_EXTENSION pDevExt, ULONG idx) {
+    ULONG found = 0;
+    if (pDevExt->ConfigurationHandle == NULL || pDevExt->NumberOfPipes == 0) {
+        RTW_ConfigureDevice(pDevExt);
+    }
+    for (ULONG i = 0; i < pDevExt->NumberOfPipes; i++) {
+        if (!(pDevExt->Pipes[i].EndpointAddress & 0x80) &&
+            pDevExt->Pipes[i].PipeType == UsbdPipeTypeBulk &&
+            pDevExt->Pipes[i].PipeHandle != NULL) {
+            if (found == idx) return pDevExt->Pipes[i].PipeHandle;
+            found++;
+        }
+    }
+    return RTW_FindBulkOutPipe(pDevExt);
+}
+
+static NTSTATUS RTW_ReadWidth(PDEVICE_OBJECT dev, USHORT addr, USHORT width, PULONG outVal) {
+    ULONG v = 0;
+    NTSTATUS st;
+    if (width == 1) {
+        UCHAR b = 0;
+        st = RTW_UsbReadReg(dev, addr, &b, 1);
+        v = b;
+    } else if (width == 2) {
+        USHORT w = 0;
+        st = RTW_UsbReadReg(dev, addr, &w, 2);
+        v = w;
+    } else {
+        st = RTW_UsbReadReg(dev, addr, &v, 4);
+    }
+    *outVal = v;
+    return st;
+}
+
+static NTSTATUS RTW_WriteWidth(PDEVICE_OBJECT dev, USHORT addr, USHORT width, ULONG val) {
+    if (width == 1) {
+        UCHAR b = (UCHAR)(val & 0xFF);
+        return RTW_UsbWriteReg(dev, addr, &b, 1);
+    } else if (width == 2) {
+        USHORT w = (USHORT)(val & 0xFFFF);
+        return RTW_UsbWriteReg(dev, addr, &w, 2);
+    } else {
+        return RTW_UsbWriteReg(dev, addr, &val, 4);
+    }
+}
+
+static void RTW_WriteRfSipi(PDEVICE_OBJECT dev, UCHAR path, USHORT rfAddr, ULONG mask, ULONG val) {
+    USHORT sipiReg = (path == 0) ? 0x0C90 : 0x0E90;
+    USHORT directReg = (USHORT)(((path == 0) ? 0x2800 : 0x2C00) + ((rfAddr & 0xFF) << 2));
+    ULONG data;
+    mask &= 0xFFFFF;
+    if (mask != 0xFFFFF) {
+        ULONG old = RTW_Read32(dev, directReg) & 0xFFFFF;
+        data = (old & ~mask) | (val & mask);
+    } else {
+        data = val & 0xFFFFF;
+    }
+    ULONG cmd = (((ULONG)(rfAddr & 0xFF) << 20) | (data & 0xFFFFF)) & 0x0FFFFFFF;
+    RTW_Write32(dev, sipiReg, cmd);
 }
 
 /* -------------------------------------------------------------
@@ -877,6 +1023,196 @@ NTSTATUS NTAPI RtwDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     status = STATUS_SUCCESS;
                     info = 0;
                 }
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+
+        case IOCTL_RTW_REG_READ: {
+            if (stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(RTW_REG_REQ) &&
+                stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(RTW_REG_REQ)) {
+                PRTW_REG_REQ req = (PRTW_REG_REQ)Irp->AssociatedIrp.SystemBuffer;
+                ULONG val = 0;
+                NTSTATUS st = RTW_ReadWidth(dev, req->Addr, req->Width, &val);
+                req->Value = val;
+                req->Status = (LONG)st;
+                info = sizeof(RTW_REG_REQ);
+                status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+
+        case IOCTL_RTW_REG_WRITE: {
+            if (stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(RTW_REG_REQ)) {
+                PRTW_REG_REQ req = (PRTW_REG_REQ)Irp->AssociatedIrp.SystemBuffer;
+                NTSTATUS st = RTW_WriteWidth(dev, req->Addr, req->Width, req->Value);
+                if (stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(RTW_REG_REQ)) {
+                    req->Status = (LONG)st;
+                    info = sizeof(RTW_REG_REQ);
+                }
+                status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+
+        case IOCTL_RTW_REG_BATCH: {
+            if (stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(ULONG)) {
+                PRTW_REG_BATCH batch = (PRTW_REG_BATCH)Irp->AssociatedIrp.SystemBuffer;
+                ULONG count = batch->Count;
+                ULONG maxOps = (stack->Parameters.DeviceIoControl.InputBufferLength - sizeof(ULONG)) / sizeof(RTW_REG_OP);
+                if (count > 256) count = 256;
+                if (count > maxOps) count = maxOps;
+                for (ULONG i = 0; i < count; i++) {
+                    PRTW_REG_OP op = &batch->Ops[i];
+                    if (op->Op == RTW_OP_WRITE) {
+                        RTW_WriteWidth(dev, op->Addr, op->Width, op->Value);
+                    } else if (op->Op == RTW_OP_MASK) {
+                        ULONG oldv = 0;
+                        RTW_ReadWidth(dev, op->Addr, op->Width, &oldv);
+                        oldv = (oldv & ~op->Mask) | (op->Value & op->Mask);
+                        RTW_WriteWidth(dev, op->Addr, op->Width, oldv);
+                    } else if (op->Op == RTW_OP_POLL) {
+                        for (ULONG t = 0; t < 500; t++) {
+                            ULONG cur = 0;
+                            RTW_ReadWidth(dev, op->Addr, op->Width, &cur);
+                            if ((cur & op->Mask) == (op->Value & op->Mask)) break;
+                        }
+                    } else if (op->Op == RTW_OP_RF_WRITE) {
+                        RTW_WriteRfSipi(dev, op->Width, op->Addr, op->Mask, op->Value);
+                    } else if (op->Op == RTW_OP_DELAY_READS) {
+                        ULONG n = op->Value;
+                        if (n > 50) n = 50;
+                        for (ULONG d = 0; d < n; d++) {
+                            RTW_Read8(dev, 0x0000);
+                        }
+                    }
+                }
+                info = 0;
+                status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+
+        case IOCTL_RTW_BULK_RX_RAW: {
+            if (stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(RTW_BULK_RX_RAW)) {
+                ULONG checkFifo = 1;
+                ULONG maxLen = 4096;
+                if (stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(RTW_BULK_RX_REQ)) {
+                    PRTW_BULK_RX_REQ req = (PRTW_BULK_RX_REQ)Irp->AssociatedIrp.SystemBuffer;
+                    checkFifo = req->CheckFifo;
+                    maxLen = req->MaxLen;
+                }
+                if (maxLen == 0 || maxLen > 4096) maxLen = 4096;
+
+                PRTW_BULK_RX_RAW rx = (PRTW_BULK_RX_RAW)Irp->AssociatedIrp.SystemBuffer;
+                RtlZeroMemory(rx, sizeof(RTW_BULK_RX_RAW));
+
+                if (pDevExt->ConfigurationHandle == NULL || pDevExt->NumberOfPipes == 0) {
+                    RTW_ConfigureDevice(pDevExt);
+                }
+
+                USHORT rxPktNum = RTW_Read16(dev, REG_RXPKTNUM);
+                rx->RxPktNum = rxPktNum;
+
+                if (checkFifo && rxPktNum == 0) {
+                    rx->Length = 0;
+                    rx->Status = (LONG)STATUS_SUCCESS;
+                    info = sizeof(RTW_BULK_RX_RAW);
+                    status = STATUS_SUCCESS;
+                    break;
+                }
+
+                USBD_PIPE_HANDLE rxPipe = RTW_FindBulkInPipe(pDevExt);
+                if (rxPipe != NULL) {
+                    ULONG bytesRead = 0;
+                    rx->Status = (LONG)RTW_UsbBulkTransfer(
+                        dev,
+                        rxPipe,
+                        USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK,
+                        rx->Data,
+                        maxLen,
+                        &bytesRead
+                    );
+                    rx->Length = bytesRead;
+                } else {
+                    rx->Length = 0;
+                    rx->Status = (LONG)STATUS_DEVICE_NOT_READY;
+                }
+                info = sizeof(RTW_BULK_RX_RAW);
+                status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+
+        case IOCTL_RTW_BULK_TX_PIPE: {
+            if (stack->Parameters.DeviceIoControl.InputBufferLength >= 8) {
+                PRTW_BULK_TX_PIPE tx = (PRTW_BULK_TX_PIPE)Irp->AssociatedIrp.SystemBuffer;
+                ULONG len = tx->Length;
+                if (len > 4200 || stack->Parameters.DeviceIoControl.InputBufferLength < 8 + len) {
+                    status = STATUS_INVALID_PARAMETER;
+                    break;
+                }
+                USBD_PIPE_HANDLE txPipe = RTW_FindBulkOutPipeByIndex(pDevExt, tx->OutPipeIdx);
+                if (txPipe != NULL) {
+                    ULONG bytesWritten = 0;
+                    status = RTW_UsbBulkTransfer(
+                        dev,
+                        txPipe,
+                        0,
+                        tx->Data,
+                        len,
+                        &bytesWritten
+                    );
+                    info = bytesWritten;
+                } else {
+                    status = STATUS_DEVICE_NOT_READY;
+                    info = 0;
+                }
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+
+        case IOCTL_RTW_GET_PIPES: {
+            if (stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(RTW_PIPES_RESP)) {
+                PRTW_PIPES_RESP out = (PRTW_PIPES_RESP)Irp->AssociatedIrp.SystemBuffer;
+                RtlZeroMemory(out, sizeof(RTW_PIPES_RESP));
+
+                if (pDevExt->ConfigurationHandle == NULL || pDevExt->NumberOfPipes == 0) {
+                    RTW_ConfigureDevice(pDevExt);
+                }
+
+                out->NumPipes = pDevExt->NumberOfPipes;
+                ULONG outCnt = 0;
+                for (ULONG i = 0; i < pDevExt->NumberOfPipes && i < 8; i++) {
+                    out->Pipes[i].EndpointAddress = pDevExt->Pipes[i].EndpointAddress;
+                    out->Pipes[i].PipeType = (UCHAR)pDevExt->Pipes[i].PipeType;
+                    out->Pipes[i].MaxPacketSize = (USHORT)pDevExt->Pipes[i].MaximumPacketSize;
+                    if (pDevExt->Pipes[i].PipeType == UsbdPipeTypeBulk) {
+                        if (pDevExt->Pipes[i].EndpointAddress & 0x80) {
+                            if (out->BulkInAddr == 0) {
+                                out->BulkInAddr = pDevExt->Pipes[i].EndpointAddress;
+                            }
+                        } else {
+                            if (outCnt < 4) {
+                                out->BulkOutAddrs[outCnt++] = pDevExt->Pipes[i].EndpointAddress;
+                            }
+                        }
+                    }
+                }
+                out->NumBulkOut = outCnt;
+                info = sizeof(RTW_PIPES_RESP);
+                status = STATUS_SUCCESS;
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
             }
