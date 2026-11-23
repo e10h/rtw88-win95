@@ -2,7 +2,8 @@ CC = i686-w64-mingw32-gcc
 CFLAGS = -O2 -s -march=pentium-mmx -mtune=pentium-mmx -mno-stack-arg-probe
 VXD_CFLAGS = -O2 -march=pentium-mmx -mtune=pentium-mmx -mno-stack-arg-probe \
              -fno-builtin -fno-stack-protector -fno-asynchronous-unwind-tables \
-             -fno-reorder-blocks-and-partition -fno-ident -fpack-struct=1
+             -fno-reorder-blocks-and-partition -fno-ident -fpack-struct=1 \
+             -fno-zero-initialized-in-bss -fno-common
 
 JWASM ?= /Users/ethan/.gemini/antigravity/brain/8dbb8657-600c-4d8e-9f0c-ae28412df3dc/scratch/tools/jwasm_bin
 JWLINK ?= /Users/ethan/.gemini/antigravity/brain/8dbb8657-600c-4d8e-9f0c-ae28412df3dc/scratch/tools/jwlink_bin
@@ -20,6 +21,10 @@ VXDDIAG.EXE: vxddiag.c
 RTW88.VXD: rtw88vxd.asm rtw88_vxd.c rtw88vxd.lnk fixvxd.py vxd/ddk/lib/libndis.clb
 	$(JWASM) -coff -Cx -Fo rtw88vxd.obj rtw88vxd.asm
 	$(CC) $(VXD_CFLAGS) -Wall -Wextra -c -o rtw88_vxd.obj rtw88_vxd.c
+	i686-w64-mingw32-objcopy \
+	  --rename-section .data=_LDATA,contents,alloc,load,code \
+	  --rename-section .rdata=_LRDATA,contents,alloc,load,code \
+	  rtw88_vxd.obj
 	$(JWLINK) @rtw88vxd.lnk
 	python3 fixvxd.py RTW88.VXD
 

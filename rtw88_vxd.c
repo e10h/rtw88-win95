@@ -422,9 +422,9 @@ extern ULONG g_VxdInitCalls;
 extern ULONG g_VxdNdisCarry;
 extern ULONG g_VxdNdisVer;
 
-static RTW88_MAC_BLOCK g_MacBlock;
-static RTW88_ADAPTER   g_Adapter;
-static RTW88_DIAG      g_Diag;
+static RTW88_MAC_BLOCK g_MacBlock = {0};
+static RTW88_ADAPTER   g_Adapter  = {0};
+static RTW88_DIAG      g_Diag     = {0};
 
 /* Local freestanding helpers (zero CRT dependencies, 0 CMOV) */
 static VOID RtwZeroMem(PVOID dst, UINT len) {

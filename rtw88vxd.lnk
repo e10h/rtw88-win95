@@ -7,9 +7,8 @@ option nodefaultlibs
 option caseexact
 segment '_LTEXT' preload nondiscardable
 segment '.text'  preload nondiscardable
-segment '.data'  preload nondiscardable
-segment '.rdata' preload nondiscardable
-segment '.bss'   preload nondiscardable
+segment '_LDATA' preload nondiscardable
+segment '_LRDATA' preload nondiscardable
 file rtw88vxd.obj
 file rtw88_vxd.obj
 library vxd/ddk/lib/libndis.clb
