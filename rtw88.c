@@ -171,7 +171,7 @@ static NDIS_STATUS NTAPI Rtw88Initialize(
         MiniportAdapterHandle,
         (NDIS_HANDLE)&g_Adapter,
         FALSE,                  /* Not a legacy DMA bus master */
-        NdisInterfaceIsa        /* Generic external adapter (correct for USB/non-ISA on Win95 NDIS 3.1) */
+        NdisInterfaceInternal   /* Virtual/software adapter — no ISA/PCI bus slot needed; correct for Win95 NDIS 3.1 */
     );
 
     return NDIS_STATUS_SUCCESS;
