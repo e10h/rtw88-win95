@@ -386,8 +386,45 @@ typedef struct _RTW88_MAC_BLOCK {
     NDIS_MAC_CHARACTERISTICS    MacCharacteristics;
 } RTW88_MAC_BLOCK, *PRTW88_MAC_BLOCK;
 
+#pragma pack(push, 1)
+typedef struct _DIOCPARAMETERS {
+    ULONG Internal1;
+    ULONG VMHandle;
+    ULONG Internal2;
+    ULONG dwIoControlCode;
+    ULONG lpvInBuffer;
+    ULONG cbInBuffer;
+    ULONG lpvOutBuffer;
+    ULONG cbOutBuffer;
+    ULONG lpcbBytesReturned;
+    ULONG lpoOverlapped;
+    ULONG hDevice;
+    ULONG tagProcess;
+} DIOCPARAMETERS, *PDIOCPARAMETERS;
+
+typedef struct _RTW88_DIAG {
+    ULONG Magic;
+    ULONG InitCalls;
+    ULONG NdisGetVerCarry;
+    ULONG NdisVersion;
+    ULONG DriverEntryCalls;
+    ULONG WrapperHandle;
+    ULONG RegMacStatus;
+    ULONG MacHandle;
+    ULONG AddAdapterCalls;
+    ULONG RegAdapterStatus;
+    ULONG AdapterHandle;
+    ULONG OpenAdapterCalls;
+} RTW88_DIAG, *PRTW88_DIAG;
+#pragma pack(pop)
+
+extern ULONG g_VxdInitCalls;
+extern ULONG g_VxdNdisCarry;
+extern ULONG g_VxdNdisVer;
+
 static RTW88_MAC_BLOCK g_MacBlock;
 static RTW88_ADAPTER   g_Adapter;
+static RTW88_DIAG      g_Diag;
 
 /* Local freestanding helpers (zero CRT dependencies, 0 CMOV) */
 static VOID RtwZeroMem(PVOID dst, UINT len) {
@@ -441,10 +478,41 @@ static NDIS_STATUS NDIS_API Rtw88AddAdapter(
 static VOID NDIS_API Rtw88RemoveAdapter(NDIS_HANDLE MacAdapterContext);
 
 /* ---------------------------------------------------------------------------
+ * W32_DEVICEIOCONTROL - Live telemetry for VXDDIAG.EXE (zero reboot needed!)
+ * --------------------------------------------------------------------------- */
+ULONG NDIS_API Rtw88DeviceIoControl(PDIOCPARAMETERS pDioc) {
+    if (!pDioc) {
+        return 0;
+    }
+    if (pDioc->dwIoControlCode == 0 || pDioc->dwIoControlCode == 0xFFFFFFFFUL) {
+        return 0; /* DIOC_OPEN / DIOC_CLOSEHANDLE */
+    }
+    if (pDioc->dwIoControlCode == 1) {
+        g_Diag.Magic           = 0x38385452UL; /* "RT88" */
+        g_Diag.InitCalls       = g_VxdInitCalls;
+        g_Diag.NdisGetVerCarry = g_VxdNdisCarry;
+        g_Diag.NdisVersion     = g_VxdNdisVer;
+        if (pDioc->lpvOutBuffer && pDioc->cbOutBuffer >= sizeof(RTW88_DIAG)) {
+            RtwCopyMem((PVOID)pDioc->lpvOutBuffer, &g_Diag, sizeof(RTW88_DIAG));
+            if (pDioc->lpcbBytesReturned) {
+                *(PULONG)pDioc->lpcbBytesReturned = sizeof(RTW88_DIAG);
+            }
+            return 0;
+        }
+        return 87; /* ERROR_INVALID_PARAMETER */
+    }
+    return 50; /* ERROR_NOT_SUPPORTED */
+}
+
+/* ---------------------------------------------------------------------------
  * DriverEntry - Called by rtw88vxd.asm on Device_Init / Sys_Dynamic_Device_Init
  * --------------------------------------------------------------------------- */
 NTSTATUS NDIS_API DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
     NDIS_STATUS status = NDIS_STATUS_FAILURE;
+
+    g_Diag.Magic = 0x38385452UL;
+    g_Diag.DriverEntryCalls++;
+    g_Diag.RegMacStatus = 0xEEEEEEEEUL;
 
     RtwZeroMem(&g_MacBlock, sizeof(g_MacBlock));
     RtwZeroMem(&g_Adapter, sizeof(g_Adapter));
@@ -455,6 +523,7 @@ NTSTATUS NDIS_API DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
         RegistryPath,
         NULL
     );
+    g_Diag.WrapperHandle = (ULONG)g_MacBlock.NdisWrapperHandle;
 
     g_MacBlock.MacCharacteristics.MajorNdisVersion             = 3;
     g_MacBlock.MacCharacteristics.MinorNdisVersion             = 0;
@@ -483,6 +552,8 @@ NTSTATUS NDIS_API DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
         &g_MacBlock.MacCharacteristics,
         sizeof(g_MacBlock.MacCharacteristics)
     );
+    g_Diag.RegMacStatus = (ULONG)status;
+    g_Diag.MacHandle    = (ULONG)g_MacBlock.NdisMacHandle;
 
     if (status != NDIS_STATUS_SUCCESS) {
         NdisTerminateWrapper(g_MacBlock.NdisWrapperHandle, NULL);
@@ -504,6 +575,7 @@ static NDIS_STATUS NDIS_API Rtw88AddAdapter(
     NDIS_ADAPTER_INFORMATION adapterInfo;
 
     (void)MacMacContext;
+    g_Diag.AddAdapterCalls++;
 
     RtwZeroMem(&g_Adapter, sizeof(g_Adapter));
     RtwCopyMem(g_Adapter.CurrentMac, g_PermanentMac, 6);
@@ -523,6 +595,8 @@ static NDIS_STATUS NDIS_API Rtw88AddAdapter(
         AdapterName,
         &adapterInfo
     );
+    g_Diag.RegAdapterStatus = (ULONG)status;
+    g_Diag.AdapterHandle    = (ULONG)g_Adapter.NdisAdapterHandle;
 
     if (status == NDIS_STATUS_SUCCESS) {
         g_Adapter.Active = TRUE;
@@ -935,3 +1009,4 @@ static NDIS_STATUS NDIS_API Rtw88QueryGlobalStatistics(
     }
     return Rtw88HandleQuery(adapter ? adapter : &g_Adapter, NULL, NdisRequest);
 }
+
