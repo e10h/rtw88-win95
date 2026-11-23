@@ -38,7 +38,6 @@ static void DeleteKeyTree(HKEY hParent, const char *subkeyName) {
 
     char childName[256];
     DWORD childLen;
-    /* Keep deleting the first subkey until none remain */
     for (;;) {
         childLen = sizeof(childName);
         if (RegEnumKeyExA(hKey, 0, childName, &childLen, NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
@@ -49,15 +48,40 @@ static void DeleteKeyTree(HKEY hParent, const char *subkeyName) {
     RegDeleteKeyA(hParent, subkeyName);
 }
 
+/* Build path to driverName in the same directory as AUTOBIND.EXE */
+static void BuildExeDirFilePath(char *outBuf, const char *fileName) {
+    char exePath[260];
+    DWORD len = GetModuleFileNameA(NULL, exePath, sizeof(exePath) - 1);
+    if (len > 0 && len < sizeof(exePath)) {
+        exePath[len] = '\0';
+        int lastSlash = -1;
+        int i;
+        for (i = 0; exePath[i]; i++) {
+            if (exePath[i] == '\\' || exePath[i] == '/') {
+                lastSlash = i;
+            }
+        }
+        if (lastSlash >= 0) {
+            exePath[lastSlash + 1] = '\0';
+            StrCpy(outBuf, exePath);
+            StrCat(outBuf, fileName);
+            return;
+        }
+    }
+    StrCpy(outBuf, fileName);
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {
     char msg[2048];
     msg[0] = '\0';
+
+    (void)hInst; (void)hPrev; (void)lpCmdLine; (void)nCmdShow;
 
     int choice = MessageBoxA(
         NULL,
         "=== Realtek RTL8822BU Windows 95 Auto-Binder ===\n\n"
         "Choose Driver Mode:\n\n"
-        "[Yes]    = Bind RTW88.SYS (NDIS 3.1 Network Miniport for TCP/IP)\n"
+        "[Yes]    = Bind RTW88.VXD (Native Win95 NDIS 3.1 VxD for TCP/IP)\n"
         "[No]     = Bind RTWPROBE.SYS (WDM Diagnostics & RTWSCAN)\n"
         "[Cancel] = Exit without changes",
         "Select Driver Mode",
@@ -71,7 +95,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     BOOL isNetMode = (choice == IDYES);
 
     const char *targetClass = isNetMode ? "Net" : "USB";
-    const char *driverName  = isNetMode ? "RTW88.SYS" : "RTWPROBE.SYS";
+    const char *driverName  = isNetMode ? "RTW88.VXD" : "RTWPROBE.SYS";
     const char *devLoader   = isNetMode ? "*ndis" : "*ntkern";
     const char *driverDesc  = isNetMode
         ? "Realtek RTL8822BU Wireless LAN 802.11ac Adapter"
@@ -82,25 +106,40 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     const char *matchId = "USB\\VID_0BDA&PID_B812";
 
     StrCat(msg, isNetMode
-        ? "=== Binding NDIS 3.1 Miniport Driver (RTW88.SYS) ===\n\n"
+        ? "=== Binding Native Win95 NDIS 3.1 VxD (RTW88.VXD) ===\n\n"
         : "=== Binding WDM Diagnostic Driver (RTWPROBE.SYS) ===\n\n");
 
     /* -------------------------------------------------------
-       Auto-copy driver file to C:\WINDOWS\SYSTEM
+       0. Auto-copy driver file to C:\WINDOWS\SYSTEM
     ------------------------------------------------------- */
     char sysDir[260];
     UINT sysLen = GetSystemDirectoryA(sysDir, sizeof(sysDir));
     if (sysLen > 0 && sysLen < 240) {
+        char srcPath[260];
         char destPath[260];
+        BuildExeDirFilePath(srcPath, driverName);
         StrCpy(destPath, sysDir);
         StrCat(destPath, "\\");
         StrCat(destPath, driverName);
-        if (CopyFileA(driverName, destPath, FALSE)) {
+
+        BOOL copied = CopyFileA(srcPath, destPath, FALSE);
+        if (!copied) {
+            copied = CopyFileA(driverName, destPath, FALSE);
+        }
+        if (copied) {
             StrCat(msg, "0. Installed driver to: ");
             StrCat(msg, destPath);
             StrCat(msg, "\n");
         } else {
-            StrCat(msg, "0. WARNING: CopyFile failed (is driver in same dir as AUTOBIND.EXE?)\n");
+            StrCat(msg, "0. ERROR: Could not copy ");
+            StrCat(msg, driverName);
+            StrCat(msg, " to ");
+            StrCat(msg, destPath);
+            StrCat(msg, "\nMake sure ");
+            StrCat(msg, driverName);
+            StrCat(msg, " is in the same folder as AUTOBIND.EXE!\n");
+            MessageBoxA(NULL, msg, "Auto-Binder Error", MB_ICONERROR);
+            ExitProcess(5);
         }
     }
 
@@ -147,7 +186,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             RegCloseKey(hSub);
 
             if (StrEqNoCase(valBuf, matchId)) {
-                /* Delete this stale key and all its subkeys */
                 DeleteKeyTree(hClassKey, subName);
                 StrCat(msg, "  Cleaned stale key: ");
                 StrCat(msg, targetClass);
@@ -173,15 +211,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             char subName[8];
             FmtIndex(subName, i);
 
-            /* Try to open — if it doesn't exist, that slot is free */
             HKEY hTest;
             LONG openRes = RegOpenKeyExA(hClassKey, subName, 0, KEY_READ, &hTest);
             if (openRes == ERROR_SUCCESS) {
                 RegCloseKey(hTest);
-                continue; /* Slot occupied by something else, skip */
+                continue;
             }
 
-            /* Slot is free — create it */
             DWORD disp = 0;
             res = RegCreateKeyExA(
                 hClassKey, subName, 0, NULL,
@@ -216,11 +252,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
         (const BYTE *)matchId, lstrlenA(matchId) + 1);
 
     if (isNetMode) {
-        /* NTMPDriver = PE-format NDIS miniport loaded by NDIS.VXD via NTKERN */
-        RegSetValueExA(hTargetClass, "NTMPDriver", 0, REG_SZ,
+        const char *propPages = "netdi.dll,EnumPropPages";
+        /* Native Win95 LE VxD driver loaded by *ndis (NDIS.VXD) via VXDLDR */
+        RegSetValueExA(hTargetClass, "DeviceVxDs", 0, REG_SZ,
             (const BYTE *)driverName, lstrlenA(driverName) + 1);
-        /* DeviceVxDs is for VxD/LE-format drivers only — must NOT be set for PE .SYS */
-        RegDeleteValueA(hTargetClass, "DeviceVxDs");
+        RegSetValueExA(hTargetClass, "EnumPropPages", 0, REG_SZ,
+            (const BYTE *)propPages, lstrlenA(propPages) + 1);
+        /* Remove any stale NTMPDriver value */
+        RegDeleteValueA(hTargetClass, "NTMPDriver");
 
         /* NDIS Subkey */
         HKEY hNdis;
@@ -228,7 +267,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
                             NULL, &hNdis, NULL) == ERROR_SUCCESS) {
             const char *logName = "RTW88";
             BYTE majorVer = 3;
-            BYTE minorVer = 10;
+            BYTE minorVer = 10; /* 0x0A = NDIS 3.10 */
             RegSetValueExA(hNdis, "LogDriverName", 0, REG_SZ,
                 (const BYTE *)logName, lstrlenA(logName) + 1);
             RegSetValueExA(hNdis, "MajorNdisVersion", 0, REG_BINARY, &majorVer, 1);
@@ -236,16 +275,28 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             RegCloseKey(hNdis);
         }
 
+        /* Ndi Subkey */
+        HKEY hNdi;
+        if (RegCreateKeyExA(hTargetClass, "Ndi", 0, NULL, 0, KEY_ALL_ACCESS,
+                            NULL, &hNdi, NULL) == ERROR_SUCCESS) {
+            const char *cardType = "PNP";
+            RegSetValueExA(hNdi, "DeviceID", 0, REG_SZ,
+                (const BYTE *)matchId, lstrlenA(matchId) + 1);
+            RegSetValueExA(hNdi, "CardType", 0, REG_SZ,
+                (const BYTE *)cardType, lstrlenA(cardType) + 1);
+            RegCloseKey(hNdi);
+        }
+
         /* Ndi\Interfaces Subkey */
         HKEY hNdiIf;
         if (RegCreateKeyExA(hTargetClass, "Ndi\\Interfaces", 0, NULL, 0, KEY_ALL_ACCESS,
                             NULL, &hNdiIf, NULL) == ERROR_SUCCESS) {
-            const char *ndis3   = "ndis3";
-            const char *eth     = "ethernet";
+            const char *ndis3 = "ndis3";
+            const char *eth   = "ethernet";
             RegSetValueExA(hNdiIf, "DefUpper",   0, REG_SZ, (const BYTE *)ndis3, lstrlenA(ndis3) + 1);
             RegSetValueExA(hNdiIf, "DefLower",   0, REG_SZ, (const BYTE *)eth,   lstrlenA(eth)   + 1);
-            RegSetValueExA(hNdiIf, "UpperRange",  0, REG_SZ, (const BYTE *)ndis3, lstrlenA(ndis3) + 1);
-            RegSetValueExA(hNdiIf, "LowerRange",  0, REG_SZ, (const BYTE *)eth,   lstrlenA(eth)   + 1);
+            RegSetValueExA(hNdiIf, "UpperRange", 0, REG_SZ, (const BYTE *)ndis3, lstrlenA(ndis3) + 1);
+            RegSetValueExA(hNdiIf, "LowerRange", 0, REG_SZ, (const BYTE *)eth,   lstrlenA(eth)   + 1);
             RegCloseKey(hNdiIf);
         }
     } else {
@@ -301,15 +352,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
                 (const BYTE *)chosenClassPath, lstrlenA(chosenClassPath) + 1);
             RegSetValueExA(hInstKey, "DevLoader", 0, REG_SZ,
                 (const BYTE *)devLoader, lstrlenA(devLoader) + 1);
-            /* ConfigFlags = 0 means no problem flags */
             RegSetValueExA(hInstKey, "ConfigFlags", 0, REG_BINARY,
                 (const BYTE *)&cfgFlags, 4);
 
             if (isNetMode) {
-                /* NTMPDriver for PE-format NDIS miniport; DeviceVxDs is VxD-only */
-                RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ,
+                RegSetValueExA(hInstKey, "DeviceVxDs", 0, REG_SZ,
                     (const BYTE *)driverName, lstrlenA(driverName) + 1);
-                RegDeleteValueA(hInstKey, "DeviceVxDs");
+                RegDeleteValueA(hInstKey, "NTMPDriver");
             } else {
                 RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ,
                     (const BYTE *)driverName, lstrlenA(driverName) + 1);
@@ -340,11 +389,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     StrCat(msg, "!\n\n"
                 "Next Steps:\n"
                 "1. Close this dialog.\n"
-                "2. REBOOT or unplug/replug the Wi-Fi dongle.\n"
-                "3. Device Manager -> Refresh.\n");
+                "2. REBOOT Windows 95.\n"
+                "3. Check Device Manager -> Network adapters.\n");
     if (isNetMode) {
-        StrCat(msg, "4. Realtek adapter should appear under 'Network adapters' with no error.\n"
-                    "5. Run winipcfg to verify IP/MAC assignment.");
+        StrCat(msg, "4. Realtek adapter should show NO '!' and NO error code.\n"
+                    "5. Open Control Panel -> Network -> TCP/IP to assign IP, then run winipcfg.");
     } else {
         StrCat(msg, "4. Run RTWTEST.EXE or RTWSCAN.EXE.");
     }
