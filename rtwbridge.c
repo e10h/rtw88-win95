@@ -129,6 +129,8 @@ static unsigned char    g_EthRxBuf[1600];
 static unsigned char    g_DecBuf[2048];
 static unsigned char    g_FrameMain[2048];
 static unsigned char    g_FrameWorker[2048];
+static unsigned char    g_PlainMain[1600];
+static unsigned char    g_PlainWorker[1600];
 
 static HANDLE           g_hDev    = INVALID_HANDLE_VALUE;
 static HANDLE           g_hDevTx  = INVALID_HANDLE_VALUE;
@@ -178,12 +180,19 @@ static int  g_HandshakeState = 0; /* 0=wait M1, 1=sent M2, 2=done */
 static u32  g_TxPnLo        = 1;
 static u32  g_TxPnHi        = 0;
 
-/* Live Bridge Counters */
+/* Live Bridge Counters & Active Data TX Mode */
 static volatile u32 g_StatTxEth   = 0;
 static volatile u32 g_StatRxEth   = 0;
 static volatile u32 g_StatRxBcn   = 0;
 static volatile u32 g_StatDecFail = 0;
 static volatile u32 g_StatEapol   = 0;
+static volatile u32 g_StatTxEcho  = 0;
+static volatile u32 g_StatRxUcast = 0;
+
+static u32 g_DataQsel   = 0U;   /* Auto-selected by TX Self-Test */
+static u32 g_DataRate   = 0U;   /* 0=1M CCK, 4=6M OFDM */
+static u32 g_DataRateId = 8U;   /* 8=B_20M, 6=G */
+static int g_DataHwSeq  = 0;    /* 0=SW seq, 1=HW seq */
 
 /* Log Buffer */
 #define LOG_MAX 32768
@@ -656,20 +665,22 @@ static int RtwMacInit(void) {
     u8 vo, vi, be, bk, mg, hi;
     u16 hq, lq, nq, exq, gapq;
     if (g_NumBulkOut == 2) {
-        vo=2; vi=2; be=2; bk=3; mg=3; hi=3; hq=64; lq=64; nq=0; exq=0; gapq=1;
+        vo=2; vi=2; be=3; bk=3; mg=3; hi=3; hq=64; lq=64; nq=0; exq=0; gapq=1;
     } else if (g_NumBulkOut == 3) {
-        vo=2; vi=2; be=1; bk=1; mg=3; hi=3; hq=64; lq=64; nq=64; exq=0; gapq=1;
+        vo=2; vi=2; be=3; bk=1; mg=3; hi=3; hq=64; lq=64; nq=64; exq=0; gapq=1;
     } else {
-        vo=2; vi=2; be=1; bk=1; mg=0; hi=3; hq=64; lq=64; nq=64; exq=64; gapq=1;
+        vo=2; vi=2; be=3; bk=1; mg=3; hi=3; hq=64; lq=64; nq=64; exq=64; gapq=1;
     }
     g_MgmtPipeIdx = DmaMapToPipe(mg);
-    /* Route Data frames through the same proven HIGH/MGMT Bulk OUT pipe (Pipe 0) */
-    g_DataPipeIdx = g_MgmtPipeIdx;
+    /* Map BE (TID0) and MGMT both to HIGH queue -> proven Bulk OUT Pipe 0 */
+    g_DataPipeIdx = DmaMapToPipe(be);
 
     u16 pqMap = (u16)((vo << 4) | (vi << 6) | (be << 8) | (bk << 10) | (mg << 12) | (hi << 14));
     RegWrite16(0x010C, pqMap);
     RegWrite8(0x0100, 0x00);
     RegWrite8(0x0100, 0xFF);
+    RegClr8(0x0101, 0x02); /* Ensure BIT_MAC_SEC_EN (HW crypto) is OFF */
+    RegWrite16(0x0680, 0x0000); /* REG_SECCFG = 0 (pure software AES-CCMP) */
     RegWrite32(0x1330, 0x80000000U);
     RegSet8(0x010C, 0x01);
 
@@ -921,8 +932,9 @@ static void RtwSetChannel2G(u8 ch) {
 /* =========================================================================
  * 802.11 Frame Transmission via Bulk OUT (48-byte RTL8822B TX Descriptor)
  * ========================================================================= */
-static int RtwSend80211(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
-                        const u8 *frame, u32 frameLen, int isMgmt) {
+static int RtwSend80211Ex(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
+                          const u8 *frame, u32 frameLen,
+                          u32 qsel, u32 rate, u32 rateId, int useHwSeq) {
     if (frameLen < 16 || frameLen > 2000) return 0;
     int isBmc = (frame[4] & 1) ? 1 : 0;
     u16 seq = (u16)((frame[22] | ((u16)frame[23] << 8)) >> 4);
@@ -931,22 +943,16 @@ static int RtwSend80211(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
     c_zero(txBuf->Data, 48);
     u32 *dw = (u32 *)txBuf->Data;
 
-    /* Use proven MGMT queue (QSEL=18, Pipe 0, DISDATAFB=1, EN_HWSEQ=1) for ALL frames!
-     * IEEE 802.11i CCMP AAD masks out Sequence Number (bits 15:4), so EN_HWSEQ=1 is 100% CCMP-safe.
-     * Mgmt/EAPOL use 1 Mbps CCK (rate=0); Data uses 11 Mbps CCK (rate=3). */
-    u32 qsel   = 18U;                  /* TX_DESC_QSEL_MGMT (proven on Auth/Assoc/M2/M4!) */
-    u32 rateId = 8U;                   /* RTW_RATEID_B_20M */
-    u32 rate   = isMgmt ? 0U : 3U;     /* 1 Mbps for mgmt/EAPOL, 11 Mbps CCK for Data */
-
     dw[0] = (frameLen & 0xFFFFU) | (48U << 16) |
-            (isBmc ? (1U << 24) : 0U) | (1U << 26) | (1U << 31); /* LS=1 | DISQSELSEQ=1 */
+            (isBmc ? (1U << 24) : 0U) | (1U << 26) |
+            (useHwSeq ? (1U << 31) : 0U); /* LS=1 | [DISQSELSEQ=1] */
     dw[1] = (qsel << 8) | (rateId << 16);
     dw[2] = 0;
-    dw[3] = (1U << 8) | (1U << 10);    /* USE_RATE=1 | DISDATAFB=1 (no FW RA needed!) */
+    dw[3] = (1U << 8) | (1U << 10);       /* USE_RATE=1 | DISDATAFB=1 (no FW RA needed!) */
     dw[4] = rate;
     dw[5] = 0; /* BW20 */
     dw[6] = 0;
-    dw[8] = (1U << 15);                /* EN_HWSEQ=1 */
+    dw[8] = useHwSeq ? (1U << 15) : 0U;   /* [EN_HWSEQ=1] */
     dw[9] = ((u32)(seq & 0xFFF) << 12);
     dw[7] = CalcTxDescChecksum(txBuf->Data);
 
@@ -959,7 +965,7 @@ static int RtwSend80211(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
         totalLen += 1;
     }
 
-    txBuf->OutPipeIdx = g_MgmtPipeIdx;
+    txBuf->OutPipeIdx = (qsel == 18U) ? g_MgmtPipeIdx : g_DataPipeIdx;
     txBuf->Length     = totalLen;
 
     DWORD br = 0;
@@ -967,6 +973,15 @@ static int RtwSend80211(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
                              txBuf, 8 + totalLen, NULL, 0, &br, NULL) ? 1 : 0;
     LeaveCriticalSection(&g_TxLock);
     return ok;
+}
+
+static int RtwSend80211(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
+                        const u8 *frame, u32 frameLen, int isMgmt) {
+    if (isMgmt) {
+        return RtwSend80211Ex(hOutDev, txBuf, frame, frameLen, 18U, 0U, 8U, 1);
+    }
+    return RtwSend80211Ex(hOutDev, txBuf, frame, frameLen,
+                          g_DataQsel, g_DataRate, g_DataRateId, g_DataHwSeq);
 }
 
 static u16 NextSeq(void) {
@@ -1304,6 +1319,50 @@ static void LogEthSummary(const char *dir, const u8 *eth, u32 len) {
     }
 }
 
+static int BuildAndSendEth80211(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
+                                u8 *frameBuf, u8 *plainBuf,
+                                const u8 *eth, u32 ethLen,
+                                u32 qsel, u32 rate, u32 rateId, int useHwSeq) {
+    if (ethLen < 14 || ethLen > 1518) return 0;
+
+    /* Build 802.11 Data frame (ToDS=1) */
+    c_zero(frameBuf, 24);
+    frameBuf[0] = 0x08;
+    frameBuf[1] = g_Encrypted ? 0x41 : 0x01;
+    c_copy(frameBuf + 4,  g_Bssid, 6);
+    c_copy(frameBuf + 10, g_StaMac, 6);
+    c_copy(frameBuf + 16, eth, 6); /* DA = Ethernet Dst MAC */
+    u16 sc = (u16)(NextSeq() << 4);
+    frameBuf[22] = (u8)sc; frameBuf[23] = (u8)(sc >> 8);
+
+    /* LLC/SNAP + payload */
+    plainBuf[0] = 0xAA; plainBuf[1] = 0xAA; plainBuf[2] = 0x03;
+    plainBuf[3] = 0x00; plainBuf[4] = 0x00; plainBuf[5] = 0x00;
+    plainBuf[6] = eth[12];
+    plainBuf[7] = eth[13];
+    u32 payLen = ethLen - 14;
+    c_copy(plainBuf + 8, eth + 14, payLen);
+    u32 plainLen = payLen + 8;
+
+    u32 bodyLen;
+    if (g_Encrypted) {
+        u8 pn[6], tk[16];
+        EnterCriticalSection(&g_Lock);
+        u32 lo = g_TxPnLo++, hi = g_TxPnHi;
+        if (g_TxPnLo == 0) g_TxPnHi++;
+        c_copy(tk, g_Ptk + 32, 16);
+        LeaveCriticalSection(&g_Lock);
+        pn[0]=(u8)lo; pn[1]=(u8)(lo>>8); pn[2]=(u8)(lo>>16); pn[3]=(u8)(lo>>24);
+        pn[4]=(u8)hi; pn[5]=(u8)(hi>>8);
+        bodyLen = ccmp_encrypt(tk, frameBuf, 24, 0, pn, plainBuf, plainLen, frameBuf + 24);
+    } else {
+        bodyLen = plainLen;
+        c_copy(frameBuf + 24, plainBuf, plainLen);
+    }
+
+    return RtwSend80211Ex(hOutDev, txBuf, frameBuf, 24 + bodyLen, qsel, rate, rateId, useHwSeq);
+}
+
 /* =========================================================================
  * Dedicated TX Worker Thread: RTW88.VXD (DIOC 2) -> 802.11 -> Bulk OUT
  * (Uses g_hDevTx exclusively; zero Control EP 0 calls!)
@@ -1335,45 +1394,17 @@ static DWORD WINAPI TxBridgeThread(LPVOID param) {
             continue; /* Hold data until 4-way handshake finishes */
         }
 
-        /* Build 802.11 Data frame (ToDS=1) */
-        u8 *f = g_FrameWorker;
-        c_zero(f, 24);
-        f[0] = 0x08;
-        f[1] = g_Encrypted ? 0x41 : 0x01;
-        c_copy(f + 4,  g_Bssid, 6);
-        c_copy(f + 10, g_StaMac, 6);
-        c_copy(f + 16, g_EthTxBuf, 6); /* DA = Ethernet Dst MAC */
-        u16 sc = (u16)(NextSeq() << 4);
-        f[22] = (u8)sc; f[23] = (u8)(sc >> 8);
-
-        /* LLC/SNAP + payload */
-        static u8 plain[1600];
-        plain[0] = 0xAA; plain[1] = 0xAA; plain[2] = 0x03;
-        plain[3] = 0x00; plain[4] = 0x00; plain[5] = 0x00;
-        plain[6] = g_EthTxBuf[12];
-        plain[7] = g_EthTxBuf[13];
-        u32 payLen = txLen - 14;
-        c_copy(plain + 8, g_EthTxBuf + 14, payLen);
-        u32 plainLen = payLen + 8;
-
-        u32 bodyLen;
-        if (g_Encrypted) {
-            u8 pn[6], tk[16];
-            EnterCriticalSection(&g_Lock);
-            u32 lo = g_TxPnLo++, hi = g_TxPnHi;
-            if (g_TxPnLo == 0) g_TxPnHi++;
-            c_copy(tk, g_Ptk + 32, 16);
-            LeaveCriticalSection(&g_Lock);
-            pn[0]=(u8)lo; pn[1]=(u8)(lo>>8); pn[2]=(u8)(lo>>16); pn[3]=(u8)(lo>>24);
-            pn[4]=(u8)hi; pn[5]=(u8)(hi>>8);
-            bodyLen = ccmp_encrypt(tk, f, 24, 0, pn, plain, plainLen, f + 24);
-        } else {
-            bodyLen = plainLen;
-            c_copy(f + 24, plain, plainLen);
-        }
-
-        if (RtwSend80211(g_hDevTx, &g_TxWorker, f, 24 + bodyLen, 0)) {
+        if (BuildAndSendEth80211(g_hDevTx, &g_TxWorker, g_FrameWorker, g_PlainWorker,
+                                 g_EthTxBuf, txLen,
+                                 g_DataQsel, g_DataRate, g_DataRateId, g_DataHwSeq)) {
             g_StatTxEth++;
+            if (g_StatTxEth <= 5) {
+                Print("[TX#"); PrintDec(g_StatTxEth); Print("] len="); PrintDec(txLen);
+                Print(" src="); PrintMac(g_EthTxBuf + 6);
+                Print(" dst="); PrintMac(g_EthTxBuf);
+                Print(" et="); PrintHex2(g_EthTxBuf[12]); PrintHex2(g_EthTxBuf[13]);
+                Print("\r\n");
+            }
             LogEthSummary("[TX]", g_EthTxBuf, txLen);
         } else {
             Print("[TX USB FAIL] err="); PrintDec(GetLastError()); Print("\r\n");
@@ -1489,69 +1520,16 @@ static void ConnFrameCb(const u8 *f, u32 len, void *vctx) {
     }
 }
 
-/* Connected Bridge RX callback */
-static void BridgeRxCb(const u8 *f, u32 len, void *vctx) {
-    (void)vctx;
-    if (len < 24) return;
-    u8 fc0 = f[0], fc1 = f[1];
-
-    if (fc0 == 0x80 && c_cmp(f + 16, g_Bssid, 6) == 0) {
-        g_StatRxBcn++;
-        return;
-    }
-
-    if ((fc0 == 0xC0 || fc0 == 0xA0) && c_cmp(f + 4, g_StaMac, 6) == 0 && c_cmp(f + 10, g_Bssid, 6) == 0) {
-        u16 reason = (len >= 26) ? (u16)(f[24] | ((u16)f[25] << 8)) : 0;
-        Print("\r\n[WARN] AP sent Deauth/Disassoc (reason="); PrintDec(reason); Print(")!\r\n");
-        return;
-    }
-
-    /* Data frame: Type=2 (0x08), not Null (bit 6 of fc0 == 0), FromDS=1 ToDS=0 */
-    if ((fc0 & 0x0C) != 0x08) return;
-    if (fc0 & 0x40) return; /* Null / QoS-Null */
-    if ((fc1 & 0x03) != 0x02) return; /* Must be FromDS=1, ToDS=0 */
-
-    const u8 *da    = f + 4;
-    const u8 *bssid = f + 10;
-    const u8 *sa    = f + 16;
-
-    if (c_cmp(bssid, g_Bssid, 6) != 0) return;
-    int isMcast = (da[0] & 1) ? 1 : 0;
-    if (!isMcast && c_cmp(da, g_StaMac, 6) != 0) return;
-    if (c_cmp(sa, g_StaMac, 6) == 0) return; /* Drop own echoed broadcast */
-
-    u32 hdrLen = ((fc0 & 0x80) == 0x80) ? 26U : 24U;
-    if (len <= hdrLen) return;
-    const u8 *body = f + hdrLen;
-    u32 bodyLen = len - hdrLen;
-
-    const u8 *llc = body;
-    u32 llcLen = bodyLen;
-    int wasEnc = (fc1 & 0x40) ? 1 : 0;
-
-    if (wasEnc) {
-        if (bodyLen < 16) return;
-        u8 keyId = (u8)((body[3] >> 6) & 3);
-        u8 key[16];
-        int haveKey = 0;
-        EnterCriticalSection(&g_Lock);
-        if (isMcast) {
-            if (g_GtkValid[keyId]) { c_copy(key, g_Gtk[keyId], 16); haveKey = 1; }
-        } else {
-            if (g_HandshakeState >= 1) { c_copy(key, g_Ptk + 32, 16); haveKey = 1; }
-        }
-        LeaveCriticalSection(&g_Lock);
-        if (!haveKey) return;
-        if (!ccmp_decrypt(key, f, hdrLen, body, bodyLen, g_DecBuf, &llcLen)) {
-            g_StatDecFail++;
-            return;
-        }
-        llc = g_DecBuf;
-    }
-
+static void DeliverLlcToVxd(const u8 *da, const u8 *sa, const u8 *llc, u32 llcLen,
+                            int wasEnc, int isUcast) {
     if (llcLen < 8) return;
     if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 ||
         llc[3] != 0x00 || llc[4] != 0x00 || llc[5] != 0x00) {
+        if (isUcast) {
+            Print("[RX UCAST NON-LLC] len="); PrintDec(llcLen); Print(" b=");
+            for (u32 i = 0; i < 8 && i < llcLen; i++) { PrintHex2(llc[i]); Print(" "); }
+            Print("\r\n");
+        }
         return;
     }
 
@@ -1585,6 +1563,161 @@ static void BridgeRxCb(const u8 *f, u32 len, void *vctx) {
     }
     g_StatRxEth++;
     LogEthSummary("[RX]", g_EthRxBuf, ethLen);
+}
+
+/* Connected Bridge RX callback */
+static void BridgeRxCb(const u8 *f, u32 len, void *vctx) {
+    (void)vctx;
+    if (len < 24) return;
+    u8 fc0 = f[0], fc1 = f[1];
+
+    if (fc0 == 0x80 && c_cmp(f + 16, g_Bssid, 6) == 0) {
+        g_StatRxBcn++;
+        return;
+    }
+
+    if ((fc0 == 0xC0 || fc0 == 0xA0) && c_cmp(f + 4, g_StaMac, 6) == 0 && c_cmp(f + 10, g_Bssid, 6) == 0) {
+        u16 reason = (len >= 26) ? (u16)(f[24] | ((u16)f[25] << 8)) : 0;
+        Print("\r\n[WARN] AP sent Deauth/Disassoc (reason="); PrintDec(reason); Print(")!\r\n");
+        return;
+    }
+
+    /* Data frame: Type=2 (0x08), not Null (bit 6 of fc0 == 0), FromDS=1 ToDS=0 */
+    if ((fc0 & 0x0C) != 0x08) return;
+    if (fc0 & 0x40) return; /* Null / QoS-Null */
+    if ((fc1 & 0x03) != 0x02) return; /* Must be FromDS=1, ToDS=0 */
+
+    const u8 *da    = f + 4;
+    const u8 *bssid = f + 10;
+    const u8 *sa    = f + 16;
+
+    if (c_cmp(bssid, g_Bssid, 6) != 0) return;
+    int isMcast = (da[0] & 1) ? 1 : 0;
+    if (!isMcast && c_cmp(da, g_StaMac, 6) != 0) return;
+    int isOwnEcho = (c_cmp(sa, g_StaMac, 6) == 0) ? 1 : 0;
+
+    int isQos = ((fc0 & 0x80) == 0x80) ? 1 : 0;
+    u32 hdrLen = isQos ? 26U : 24U;
+    if (isQos && (fc1 & 0x80)) hdrLen += 4U; /* +HTC / Order bit */
+    if (len <= hdrLen) return;
+    int isAmsdu = (isQos && (f[24] & 0x80)) ? 1 : 0;
+
+    const u8 *body = f + hdrLen;
+    u32 bodyLen = len - hdrLen;
+
+    const u8 *llc = body;
+    u32 llcLen = bodyLen;
+    int wasEnc = (fc1 & 0x40) ? 1 : 0;
+
+    if (wasEnc) {
+        if (bodyLen < 16) return;
+        u8 keyId = (u8)((body[3] >> 6) & 3);
+        u8 key[16];
+        int haveKey = 0;
+        EnterCriticalSection(&g_Lock);
+        if (isMcast) {
+            if (g_GtkValid[keyId]) { c_copy(key, g_Gtk[keyId], 16); haveKey = 1; }
+        } else {
+            if (g_HandshakeState >= 1) { c_copy(key, g_Ptk + 32, 16); haveKey = 1; }
+        }
+        LeaveCriticalSection(&g_Lock);
+        if (!haveKey) return;
+        if (!ccmp_decrypt(key, f, hdrLen, body, bodyLen, g_DecBuf, &llcLen)) {
+            g_StatDecFail++;
+            if (!isMcast) {
+                Print("[RX UCAST DECFAIL] fc="); PrintHex2(fc0); Print(" "); PrintHex2(fc1);
+                Print(" len="); PrintDec(len); Print(" hdr="); PrintDec(hdrLen);
+                Print(" kid="); PrintDec(keyId); Print("\r\n");
+            }
+            return;
+        }
+        llc = g_DecBuf;
+    }
+
+    if (isOwnEcho) {
+        g_StatTxEcho++;
+        if (g_StatTxEcho <= 10) {
+            Print("[ECHO OK!] AP received & decrypted our broadcast (#");
+            PrintDec(g_StatTxEcho); Print(")\r\n");
+        }
+        return; /* Never loop our own broadcast back into RTW88.VXD */
+    }
+
+    if (!isMcast) g_StatRxUcast++;
+
+    if (isAmsdu) {
+        u32 off = 0;
+        while (off + 14 <= llcLen) {
+            const u8 *subDa = llc + off;
+            const u8 *subSa = llc + off + 6;
+            u32 subLen = ((u32)llc[off + 12] << 8) | llc[off + 13];
+            if (off + 14 + subLen > llcLen) break;
+            if (c_cmp(subSa, g_StaMac, 6) != 0) {
+                DeliverLlcToVxd(subDa, subSa, llc + off + 14, subLen, wasEnc, !isMcast);
+            }
+            u32 step = (14U + subLen + 3U) & ~3U;
+            if (step == 0) break;
+            off += step;
+        }
+    } else {
+        DeliverLlcToVxd(da, sa, llc, llcLen, wasEnc, !isMcast);
+    }
+}
+
+/* Built-in live TX mode auto-probe: sends encrypted ARP Req to 192.168.1.1 and
+ * checks for [ECHO OK!] (AP re-broadcast) or [RX] ARP REP to lock the best TX mode! */
+static void RunTxSelfTest(void) {
+    static const struct { u32 qsel; u32 rate; u32 rateId; int hwSeq; const char *name; } modes[] = {
+        { 0U,  0U, 8U, 0, "QSEL=0(TID0) 1M-CCK SwSeq" },
+        { 18U, 0U, 8U, 1, "QSEL=18(MGMT) 1M-CCK HwSeq" },
+        { 0U,  4U, 6U, 0, "QSEL=0(TID0) 6M-OFDM SwSeq" },
+        { 18U, 4U, 6U, 1, "QSEL=18(MGMT) 6M-OFDM HwSeq" }
+    };
+
+    /* Standard 42-byte Ethernet ARP Request: who-has 192.168.1.1 tell 192.168.1.150 */
+    u8 arp[42];
+    c_zero(arp, sizeof(arp));
+    for (int i = 0; i < 6; i++) arp[i] = 0xFF;
+    c_copy(arp + 6, g_StaMac, 6);
+    arp[12] = 0x08; arp[13] = 0x06; /* ARP */
+    arp[14] = 0x00; arp[15] = 0x01; /* Ethernet */
+    arp[16] = 0x08; arp[17] = 0x00; /* IPv4 */
+    arp[18] = 6; arp[19] = 4;
+    arp[20] = 0x00; arp[21] = 0x01; /* Request */
+    c_copy(arp + 22, g_StaMac, 6);
+    arp[28] = 192; arp[29] = 168; arp[30] = 1; arp[31] = 150;
+    arp[38] = 192; arp[39] = 168; arp[40] = 1; arp[41] = 1;
+
+    Print("[TEST] Probing best Data TX mode (encrypted ARP -> 192.168.1.1)...\r\n");
+    int locked = 0;
+    for (int m = 0; m < 4 && !locked; m++) {
+        u32 echo0 = g_StatTxEcho;
+        u32 ucast0 = g_StatRxUcast;
+        Print("  Try "); Print(modes[m].name); Print("... ");
+        BuildAndSendEth80211(g_hDev, &g_TxMain, g_FrameMain, g_PlainMain,
+                             arp, sizeof(arp),
+                             modes[m].qsel, modes[m].rate, modes[m].rateId, modes[m].hwSeq);
+        DWORD t0 = GetTickCount();
+        while ((GetTickCount() - t0) < 600) {
+            PollRxBatch(BridgeRxCb, NULL);
+            if (g_StatTxEcho > echo0 || g_StatRxUcast > ucast0) {
+                g_DataQsel   = modes[m].qsel;
+                g_DataRate   = modes[m].rate;
+                g_DataRateId = modes[m].rateId;
+                g_DataHwSeq  = modes[m].hwSeq;
+                Print("LOCKED! (Echo="); PrintDec(g_StatTxEcho - echo0);
+                Print(" Ucast="); PrintDec(g_StatRxUcast - ucast0); Print(")\r\n");
+                locked = 1;
+                break;
+            }
+        }
+        if (!locked) Print("no reply\r\n");
+    }
+    if (!locked) {
+        /* Fallback to exact M2/M4 proven parameters */
+        g_DataQsel = 18U; g_DataRate = 0U; g_DataRateId = 8U; g_DataHwSeq = 1;
+        Print("  [WARN] No ARP echo/reply; fallback to QSEL=18 1M-CCK HwSeq.\r\n");
+    }
 }
 
 /* =========================================================================
@@ -1863,11 +1996,13 @@ void mainCRTStartup(void) {
         Print("[6/6] Open link UP!\r\n");
     }
 
+    /* Probe & lock the best Data TX mode with a live encrypted ARP test */
+    RunTxSelfTest();
+
     Print("\r\n=========================================================\r\n");
     Print("  WI-FI CONNECTED & BRIDGING! Leave this window open!\r\n");
     Print("  Now open another MS-DOS Prompt and run:\r\n");
-    Print("    winipcfg  (click Renew All to get a real IP!)\r\n");
-    Print("    ping 1.1.1.1   or   ping apple.com\r\n");
+    Print("    ping 192.168.1.1   (or ping 1.1.1.1 / apple.com)\r\n");
     Print("=========================================================\r\n\r\n");
     SaveLog();
 
@@ -1896,6 +2031,8 @@ void mainCRTStartup(void) {
             }
             Print("[STAT] TX="); PrintDec(g_StatTxEth);
             Print(" RX="); PrintDec(g_StatRxEth);
+            Print(" Echo="); PrintDec(g_StatTxEcho);
+            Print(" Ucast="); PrintDec(g_StatRxUcast);
             Print(" VxdTx="); PrintDec(vxdTxQ);
             Print(" VxdRx="); PrintDec(vxdRxInj);
             Print(" BCN="); PrintDec(g_StatRxBcn);

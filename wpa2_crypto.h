@@ -439,7 +439,7 @@ static u32 ccmp_build_aad_and_nonce(const u8 *hdr, u32 hdrLen, const u8 pn[6],
      *   A1(6), A2(6), A3(6), SC & 0x000F (2), [A4(6)], [QC & 0x000F (2)] */
     u32 pos = 0;
     aad[pos++] = (u8)(fc0 & 0x8F);
-    aad[pos++] = (u8)((fc1 & 0xC7) | 0x40);
+    aad[pos++] = (u8)((fc1 & (isQos ? 0x47 : 0xC7)) | 0x40);
     c_copy(aad + pos, hdr + 4, 18); pos += 18; /* A1, A2, A3 */
     aad[pos++] = (u8)(hdr[22] & 0x0F);
     aad[pos++] = 0x00;
