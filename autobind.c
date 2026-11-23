@@ -216,10 +216,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
         (const BYTE *)matchId, lstrlenA(matchId) + 1);
 
     if (isNetMode) {
-        RegSetValueExA(hTargetClass, "DeviceVxDs", 0, REG_SZ,
+        /* NTMPDriver = PE-format NDIS miniport loaded by NDIS.VXD via NTKERN */
+        RegSetValueExA(hTargetClass, "NTMPDriver", 0, REG_SZ,
             (const BYTE *)driverName, lstrlenA(driverName) + 1);
-        /* Explicitly ensure NTMPDriver does NOT exist */
-        RegDeleteValueA(hTargetClass, "NTMPDriver");
+        /* DeviceVxDs is for VxD/LE-format drivers only — must NOT be set for PE .SYS */
+        RegDeleteValueA(hTargetClass, "DeviceVxDs");
 
         /* NDIS Subkey */
         HKEY hNdis;
@@ -305,9 +306,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
                 (const BYTE *)&cfgFlags, 4);
 
             if (isNetMode) {
-                RegSetValueExA(hInstKey, "DeviceVxDs", 0, REG_SZ,
+                /* NTMPDriver for PE-format NDIS miniport; DeviceVxDs is VxD-only */
+                RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ,
                     (const BYTE *)driverName, lstrlenA(driverName) + 1);
-                RegDeleteValueA(hInstKey, "NTMPDriver");
+                RegDeleteValueA(hInstKey, "DeviceVxDs");
             } else {
                 RegSetValueExA(hInstKey, "NTMPDriver", 0, REG_SZ,
                     (const BYTE *)driverName, lstrlenA(driverName) + 1);
