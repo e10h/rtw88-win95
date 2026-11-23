@@ -1364,40 +1364,41 @@ static int BuildAndSendEth80211(HANDLE hOutDev, RTW_BULK_TX_PIPE *txBuf,
 }
 
 /* =========================================================================
- * Dedicated TX Worker Thread: RTW88.VXD (DIOC 2) -> 802.11 -> Bulk OUT
- * (Uses g_hDevTx exclusively; zero Control EP 0 calls!)
+ * Single-Threaded TX Drainer: RTW88.VXD (DIOC 2) -> 802.11 -> Bulk OUT
+ * Uses g_hDev sequentially (zero concurrent USB Bulk IN/OUT on Win95 OHCI!)
  * ========================================================================= */
-static DWORD WINAPI TxBridgeThread(LPVOID param) {
-    (void)param;
-    DWORD lastKeepalive = GetTickCount();
-
-    while (g_Running) {
+static void FlushStaleVxdTx(void) {
+    if (g_hVxd == INVALID_HANDLE_VALUE) return;
+    int dropped = 0;
+    for (int i = 0; i < 64; i++) {
         DWORD txLen = 0;
-        BOOL popped = FALSE;
-        if (g_hVxd != INVALID_HANDLE_VALUE) {
-            EnterCriticalSection(&g_VxdLock);
-            popped = DeviceIoControl(g_hVxd, RTW88_DIOC_POP_TX,
-                                     NULL, 0, g_EthTxBuf, sizeof(g_EthTxBuf), &txLen, NULL);
-            LeaveCriticalSection(&g_VxdLock);
+        if (!DeviceIoControl(g_hVxd, RTW88_DIOC_POP_TX,
+                             NULL, 0, g_EthTxBuf, sizeof(g_EthTxBuf), &txLen, NULL) || txLen == 0) {
+            break;
         }
-        if (!popped || txLen < 14 || txLen > 1518) {
-            DWORD now = GetTickCount();
-            if ((now - lastKeepalive) >= 12000) {
-                lastKeepalive = now;
-                SendNullKeepalive(g_hDevTx, &g_TxWorker);
-            }
-            Sleep(2);
-            continue;
-        }
+        dropped++;
+    }
+    if (dropped > 0) {
+        Print("  Flushed "); PrintDec((u32)dropped); Print(" stale queued TX frame(s) from RTW88.VXD\r\n");
+    }
+}
 
-        if (g_ApIsWpa2 && !g_Encrypted) {
-            continue; /* Hold data until 4-way handshake finishes */
-        }
+static int DrainVxdTx(void) {
+    if (g_hVxd == INVALID_HANDLE_VALUE) return 0;
+    if (g_ApIsWpa2 && !g_Encrypted) return 0;
 
-        if (BuildAndSendEth80211(g_hDevTx, &g_TxWorker, g_FrameWorker, g_PlainWorker,
+    int sent = 0;
+    for (int burst = 0; burst < 16; burst++) {
+        DWORD txLen = 0;
+        BOOL popped = DeviceIoControl(g_hVxd, RTW88_DIOC_POP_TX,
+                                      NULL, 0, g_EthTxBuf, sizeof(g_EthTxBuf), &txLen, NULL);
+        if (!popped || txLen < 14 || txLen > 1518) break;
+
+        if (BuildAndSendEth80211(g_hDev, &g_TxMain, g_FrameMain, g_PlainMain,
                                  g_EthTxBuf, txLen,
                                  g_DataQsel, g_DataRate, g_DataRateId, g_DataHwSeq)) {
             g_StatTxEth++;
+            sent++;
             if (g_StatTxEth <= 5) {
                 Print("[TX#"); PrintDec(g_StatTxEth); Print("] len="); PrintDec(txLen);
                 Print(" src="); PrintMac(g_EthTxBuf + 6);
@@ -1408,10 +1409,10 @@ static DWORD WINAPI TxBridgeThread(LPVOID param) {
             LogEthSummary("[TX]", g_EthTxBuf, txLen);
         } else {
             Print("[TX USB FAIL] err="); PrintDec(GetLastError()); Print("\r\n");
+            break;
         }
-        lastKeepalive = GetTickCount();
     }
-    return 0;
+    return sent;
 }
 
 /* =========================================================================
@@ -1717,6 +1718,24 @@ static void RunTxSelfTest(void) {
         /* Fallback to exact M2/M4 proven parameters */
         g_DataQsel = 18U; g_DataRate = 0U; g_DataRateId = 8U; g_DataHwSeq = 1;
         Print("  [WARN] No ARP echo/reply; fallback to QSEL=18 1M-CCK HwSeq.\r\n");
+    } else if (g_DataRate == 0U && g_DataQsel == 0U) {
+        /* Bonus check: see if AP also accepts 6 Mbps OFDM on QSEL=0 for 6x faster throughput */
+        u32 echo0 = g_StatTxEcho, ucast0 = g_StatRxUcast;
+        Print("  Try speed upgrade QSEL=0 6M-OFDM... ");
+        BuildAndSendEth80211(g_hDev, &g_TxMain, g_FrameMain, g_PlainMain,
+                             arp, sizeof(arp), 0U, 4U, 6U, 0);
+        DWORD t0 = GetTickCount();
+        int fastOk = 0;
+        while ((GetTickCount() - t0) < 350) {
+            PollRxBatch(BridgeRxCb, NULL);
+            if (g_StatTxEcho > echo0 || g_StatRxUcast > ucast0) {
+                g_DataRate = 4U; g_DataRateId = 6U;
+                Print("UPGRADED to 6 Mbps OFDM!\r\n");
+                fastOk = 1;
+                break;
+            }
+        }
+        if (!fastOk) Print("keeping 1 Mbps CCK\r\n");
     }
 }
 
@@ -1837,12 +1856,10 @@ void mainCRTStartup(void) {
         Print("[1/6] WARN: \\\\.\\RTW88.VXD not open (err="); PrintDec(GetLastError()); Print(")\r\n");
     }
 
-    /* 2. Open two handles to RTWPROBE (RX/Control + dedicated TX worker) */
+    /* 2. Open single serialized handle to RTWPROBE (zero concurrent USB URBs!) */
     g_hDev = CreateFileA("\\\\.\\RTWPROBE", GENERIC_READ | GENERIC_WRITE,
                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    g_hDevTx = CreateFileA("\\\\.\\RTWPROBE", GENERIC_READ | GENERIC_WRITE,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    if (g_hDev == INVALID_HANDLE_VALUE || g_hDevTx == INVALID_HANDLE_VALUE) {
+    if (g_hDev == INVALID_HANDLE_VALUE) {
         Print("[FATAL] Cannot open \\\\.\\RTWPROBE (err="); PrintDec(GetLastError()); Print(")\r\n");
         SaveLog(); WaitForEnter(); ExitProcess(1);
     }
@@ -1996,7 +2013,8 @@ void mainCRTStartup(void) {
         Print("[6/6] Open link UP!\r\n");
     }
 
-    /* Probe & lock the best Data TX mode with a live encrypted ARP test */
+    /* Flush any old queued frames from before bridge started, then probe TX mode */
+    FlushStaleVxdTx();
     RunTxSelfTest();
 
     Print("\r\n=========================================================\r\n");
@@ -2006,34 +2024,42 @@ void mainCRTStartup(void) {
     Print("=========================================================\r\n\r\n");
     SaveLog();
 
-    /* Launch dedicated TX worker thread (RTW88.VXD DIOC 2 -> Bulk OUT) */
-    DWORD tid = 0;
-    HANDLE hTxThread = CreateThread(NULL, 0, TxBridgeThread, NULL, 0, &tid);
-
-    /* Main RX loop (Bulk IN -> Decrypt -> RTW88.VXD DIOC 3) */
+    /* Single-threaded TX/RX bridge loop on g_hDev (zero USB handle contention!) */
     DWORD lastStat = GetTickCount();
+    DWORD lastKeepalive = GetTickCount();
     while (g_Running) {
+        /* 1. Drain any outbound frames queued by Windows 95 VTCP.386 */
+        if (DrainVxdTx() > 0) lastKeepalive = GetTickCount();
+
+        /* 2. Receive next Bulk IN batch (returns in ~2ms on reply, <=100ms on beacon) */
         PollRxBatch(BridgeRxCb, NULL);
+
+        /* 3. Immediately transmit any synchronous reply VTCP.386 queued during DIOC 3 */
+        if (DrainVxdTx() > 0) lastKeepalive = GetTickCount();
+
         DWORD now = GetTickCount();
+        if ((now - lastKeepalive) >= 12000) {
+            lastKeepalive = now;
+            SendNullKeepalive(g_hDev, &g_TxMain);
+        }
         if ((now - lastStat) >= 10000) {
             lastStat = now;
-            DWORD vxdTxQ = 0, vxdRxInj = 0;
+            DWORD vxdTxQ = 0, vxdDeq = 0, vxdRxInj = 0;
             if (g_hVxd != INVALID_HANDLE_VALUE) {
                 RTW88_DIAG d;
                 DWORD cb = 0;
                 c_zero(&d, sizeof(d));
-                EnterCriticalSection(&g_VxdLock);
                 if (DeviceIoControl(g_hVxd, RTW88_DIOC_GET_DIAG, NULL, 0, &d, sizeof(d), &cb, NULL)) {
                     vxdTxQ = d.TxEnqueued;
+                    vxdDeq = d.TxDequeued;
                     vxdRxInj = d.RxInjected;
                 }
-                LeaveCriticalSection(&g_VxdLock);
             }
             Print("[STAT] TX="); PrintDec(g_StatTxEth);
             Print(" RX="); PrintDec(g_StatRxEth);
-            Print(" Echo="); PrintDec(g_StatTxEcho);
             Print(" Ucast="); PrintDec(g_StatRxUcast);
             Print(" VxdTx="); PrintDec(vxdTxQ);
+            Print("/"); PrintDec(vxdDeq);
             Print(" VxdRx="); PrintDec(vxdRxInj);
             Print(" BCN="); PrintDec(g_StatRxBcn);
             Print(" DecFail="); PrintDec(g_StatDecFail); Print("\r\n");
@@ -2041,8 +2067,6 @@ void mainCRTStartup(void) {
         }
     }
 
-    if (hTxThread) { WaitForSingleObject(hTxThread, 1000); CloseHandle(hTxThread); }
-    CloseHandle(g_hDevTx);
     CloseHandle(g_hDev);
     if (g_hVxd != INVALID_HANDLE_VALUE) CloseHandle(g_hVxd);
     SaveLog();
