@@ -120,7 +120,6 @@ typedef struct _RTW88_DIAG {
 static RTW_REG_BATCH    g_Batch;
 static RTW_BULK_RX_RAW  g_RxRaw;
 static RTW_BULK_TX_PIPE g_TxMain;
-static RTW_BULK_TX_PIPE g_TxWorker;
 static RTW_PIPES_RESP   g_Pipes;
 static unsigned char    g_FwBuf[196608];
 static unsigned char    g_LogMap[768];
@@ -128,12 +127,9 @@ static unsigned char    g_EthTxBuf[1600];
 static unsigned char    g_EthRxBuf[1600];
 static unsigned char    g_DecBuf[2048];
 static unsigned char    g_FrameMain[2048];
-static unsigned char    g_FrameWorker[2048];
 static unsigned char    g_PlainMain[1600];
-static unsigned char    g_PlainWorker[1600];
 
 static HANDLE           g_hDev    = INVALID_HANDLE_VALUE;
-static HANDLE           g_hDevTx  = INVALID_HANDLE_VALUE;
 static HANDLE           g_hVxd    = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_Lock;
 static CRITICAL_SECTION g_PrintLock;
@@ -141,6 +137,16 @@ static CRITICAL_SECTION g_VxdLock;
 static CRITICAL_SECTION g_TxLock;
 static volatile int     g_Running = 1;
 static u8               g_ForceCh = 0;
+
+/* Native Win95 GUI Handles & Display Buffers */
+static HWND             g_hWnd    = NULL;
+static HWND             g_hStatus = NULL;
+static HWND             g_hStats  = NULL;
+static HWND             g_hEdit   = NULL;
+static char             g_StatusText[160];
+static char             g_DispBuf[14000];
+static volatile int     g_LogDirty    = 0;
+static volatile int     g_StatusDirty = 1;
 
 /* Hardware Info */
 static u8  g_CutVer        = 0;
@@ -200,7 +206,7 @@ static char g_LogBuf[LOG_MAX];
 static u32  g_LogLen = 0;
 
 /* =========================================================================
- * Console & String Helpers (No Libc)
+ * GUI Log, Status & String Helpers (No Libc, Win95 Safe)
  * ========================================================================= */
 static u32 StrLen(const char *s) {
     const volatile char *p = (const volatile char *)s;
@@ -209,28 +215,54 @@ static u32 StrLen(const char *s) {
     return n;
 }
 
+static void StrAppend(char *dst, u32 maxLen, const char *src) {
+    u32 d = StrLen(dst);
+    for (u32 i = 0; src[i] && d + 1 < maxLen; i++) dst[d++] = src[i];
+    dst[d] = '\0';
+}
+
+static void StrAppendDec(char *dst, u32 maxLen, unsigned long v) {
+    char t[16], b[16];
+    int n = 0, j = 0;
+    if (v == 0) { StrAppend(dst, maxLen, "0"); return; }
+    while (v > 0) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n > 0) b[j++] = t[--n];
+    b[j] = '\0';
+    StrAppend(dst, maxLen, b);
+}
+
+static void SetStatus(const char *s) {
+    EnterCriticalSection(&g_PrintLock);
+    g_StatusText[0] = '\0';
+    StrAppend(g_StatusText, sizeof(g_StatusText), s);
+    g_StatusDirty = 1;
+    LeaveCriticalSection(&g_PrintLock);
+}
+
 static void Print(const char *s) {
     u32 len = StrLen(s);
+    if (!len) return;
     EnterCriticalSection(&g_PrintLock);
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (h && h != INVALID_HANDLE_VALUE && len) {
-        DWORD w = 0;
-        WriteFile(h, s, len, &w, NULL);
+    /* Rolling 32 KB log buffer so long sessions never stop logging */
+    if (g_LogLen + len + 1 >= LOG_MAX) {
+        u32 keep = LOG_MAX / 2;
+        if (keep < g_LogLen) {
+            u32 drop = g_LogLen - keep;
+            while (drop < g_LogLen && g_LogBuf[drop] != '\n') drop++;
+            if (drop < g_LogLen) drop++;
+            u32 rem = g_LogLen - drop;
+            for (u32 i = 0; i < rem; i++) g_LogBuf[i] = g_LogBuf[drop + i];
+            g_LogLen = rem;
+        } else {
+            g_LogLen = 0;
+        }
     }
     for (u32 i = 0; i < len && g_LogLen + 1 < LOG_MAX; i++) {
         g_LogBuf[g_LogLen++] = s[i];
     }
     g_LogBuf[g_LogLen] = '\0';
+    g_LogDirty = 1;
     LeaveCriticalSection(&g_PrintLock);
-}
-
-static void PrintHexN(unsigned long v, int d) {
-    static const char hx[] = "0123456789ABCDEF";
-    char b[16];
-    b[0] = '0'; b[1] = 'x';
-    for (int i = 0; i < d; i++) b[2 + i] = hx[(v >> ((d - 1 - i) * 4)) & 0xF];
-    b[2 + d] = '\0';
-    Print(b);
 }
 
 static void PrintHex2(u8 v) {
@@ -266,20 +298,45 @@ static void PrintIp(const u8 *ip) {
     PrintDec(ip[3]);
 }
 
-static void SaveLog(void) {
-    HANDLE h = CreateFileA("RTWBRIDG.LOG", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h != INVALID_HANDLE_VALUE) {
-        DWORD w = 0;
-        WriteFile(h, g_LogBuf, g_LogLen, &w, NULL);
-        CloseHandle(h);
+static void BuildExeDirPath(char *out, u32 maxLen, const char *name) {
+    char exe[260];
+    DWORD len = GetModuleFileNameA(NULL, exe, sizeof(exe) - 1);
+    out[0] = '\0';
+    if (len > 0 && len < sizeof(exe)) {
+        exe[len] = '\0';
+        int last = -1;
+        for (int i = 0; exe[i]; i++) {
+            if (exe[i] == '\\' || exe[i] == '/') last = i;
+        }
+        if (last >= 0) {
+            exe[last + 1] = '\0';
+            StrAppend(out, maxLen, exe);
+        }
     }
+    StrAppend(out, maxLen, name);
 }
 
-static void WaitForEnter(void) {
-    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
-    if (hIn && hIn != INVALID_HANDLE_VALUE) {
-        char c; DWORD r = 0;
-        ReadFile(hIn, &c, 1, &r, NULL);
+static HANDLE OpenLocalFileRead(const char *name) {
+    HANDLE h = CreateFileA(name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) return h;
+    char full[300];
+    BuildExeDirPath(full, sizeof(full), name);
+    return CreateFileA(full, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+}
+
+static void SaveLog(void) {
+    char path[300];
+    BuildExeDirPath(path, sizeof(path), "RTWBRIDG.LOG");
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        h = CreateFileA("RTWBRIDG.LOG", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w = 0;
+        EnterCriticalSection(&g_PrintLock);
+        WriteFile(h, g_LogBuf, g_LogLen, &w, NULL);
+        LeaveCriticalSection(&g_PrintLock);
+        CloseHandle(h);
     }
 }
 
@@ -420,7 +477,7 @@ static void ReadEfuse(void) {
         for (int i = 0; i < 4; i++) {
             if (wen & (1 << i)) continue;
             u16 li = (u16)(((u16)blk << 3) + (i << 1));
-            if (phyIdx + 2 > maxPhy || li + 2 > sizeof(g_LogMap)) { phyIdx = maxPhy; break; }
+            if (phyIdx + 2 > maxPhy || (u32)(li + 2) > sizeof(g_LogMap)) { phyIdx = maxPhy; break; }
             u8 b0 = EfuseReadPhyByte(phyIdx++, &ok);
             u8 b1 = EfuseReadPhyByte(phyIdx++, &ok);
             if (!ok) { phyIdx = maxPhy; break; }
@@ -594,7 +651,7 @@ static int DownloadFwSeg(const u8 *data, u32 dst, u32 size) {
 }
 
 static int RtwDownloadFirmware(void) {
-    HANDLE hFw = CreateFileA("rtw8822b_fw.bin", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE hFw = OpenLocalFileRead("rtw8822b_fw.bin");
     if (hFw == INVALID_HANDLE_VALUE) { Print("  [ERR] rtw8822b_fw.bin not found!\r\n"); return 0; }
     DWORD fwSz = GetFileSize(hFw, NULL), br = 0;
     if (fwSz < 64 || fwSz > sizeof(g_FwBuf)) { CloseHandle(hFw); return 0; }
@@ -1715,9 +1772,9 @@ static void RunTxSelfTest(void) {
         if (!locked) Print("no reply\r\n");
     }
     if (!locked) {
-        /* Fallback to exact M2/M4 proven parameters */
-        g_DataQsel = 18U; g_DataRate = 0U; g_DataRateId = 8U; g_DataHwSeq = 1;
-        Print("  [WARN] No ARP echo/reply; fallback to QSEL=18 1M-CCK HwSeq.\r\n");
+        /* Fallback to proven QSEL=0 1M-CCK SwSeq mode */
+        g_DataQsel = 0U; g_DataRate = 0U; g_DataRateId = 8U; g_DataHwSeq = 0;
+        Print("  [INFO] Using default QSEL=0 1M-CCK SwSeq.\r\n");
     } else if (g_DataRate == 0U && g_DataQsel == 0U) {
         /* Bonus check: see if AP also accepts 6 Mbps OFDM on QSEL=0 for 6x faster throughput */
         u32 echo0 = g_StatTxEcho, ucast0 = g_StatRxUcast;
@@ -1779,7 +1836,7 @@ static int LoadConfig(void) {
     g_ForceCh = ParseDecU8(chStr);
 
     if (g_TargetSsid[0] == '\0') {
-        HANDLE h = CreateFileA("WIFI.TXT", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        HANDLE h = OpenLocalFileRead("WIFI.TXT");
         if (h != INVALID_HANDLE_VALUE) {
             char buf[256];
             DWORD br = 0;
@@ -1815,26 +1872,23 @@ static int LoadConfig(void) {
 }
 
 /* =========================================================================
- * Main Entry Point
+ * Single-Threaded USB Bridge Worker (Runs in Native Win95 GUI Background!)
  * ========================================================================= */
-void mainCRTStartup(void) {
-    InitializeCriticalSection(&g_Lock);
-    InitializeCriticalSection(&g_PrintLock);
-    InitializeCriticalSection(&g_VxdLock);
-    InitializeCriticalSection(&g_TxLock);
+static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
+    (void)param;
 
     Print("=========================================================\r\n");
-    Print("  RTL8822BU Win95 Wi-Fi Bridge (Open + WPA2-PSK CCMP)\r\n");
+    Print("  RTL8822BU Win95 Wi-Fi Bridge (Native GUI + WPA2-CCMP)\r\n");
     Print("=========================================================\r\n");
 
     if (!LoadConfig()) {
+        SetStatus("Error: WIFI.TXT not found (Line 1 = SSID, Line 2 = Password)");
         Print("\r\nUsage:\r\n");
         Print("  RTWBRIDGE.EXE \"SSID\"             (Open Wi-Fi)\r\n");
         Print("  RTWBRIDGE.EXE \"SSID\" \"PASSWORD\"  (WPA2-PSK Wi-Fi)\r\n");
-        Print("  Or create WIFI.TXT with Line 1 = SSID, Line 2 = Password.\r\n");
-        Print("\r\nPress ENTER to exit...");
-        WaitForEnter();
-        ExitProcess(1);
+        Print("  Or create WIFI.TXT in this folder:\r\n");
+        Print("    Line 1 = SSID\r\n    Line 2 = Password\r\n    Line 3 = Channel (optional)\r\n");
+        return 1;
     }
 
     Print("Target SSID: \""); Print(g_TargetSsid); Print("\"");
@@ -1842,6 +1896,7 @@ void mainCRTStartup(void) {
     else Print(" (OPEN)\r\n");
 
     /* 1. Open RTW88.VXD (without DELETE_ON_CLOSE!) & grab VTCP.386's exact MAC */
+    SetStatus("Opening RTW88.VXD & RTWPROBE...");
     g_hVxd = CreateFileA("\\\\.\\RTW88.VXD", 0, 0, NULL, 0, 0, NULL);
     if (g_hVxd != INVALID_HANDLE_VALUE) {
         RTW88_DIAG diag;
@@ -1860,14 +1915,18 @@ void mainCRTStartup(void) {
     g_hDev = CreateFileA("\\\\.\\RTWPROBE", GENERIC_READ | GENERIC_WRITE,
                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (g_hDev == INVALID_HANDLE_VALUE) {
+        SetStatus("FATAL: Cannot open \\\\.\\RTWPROBE (plug in USB Wi-Fi dongle!)");
         Print("[FATAL] Cannot open \\\\.\\RTWPROBE (err="); PrintDec(GetLastError()); Print(")\r\n");
-        SaveLog(); WaitForEnter(); ExitProcess(1);
+        SaveLog();
+        return 1;
     }
 
     DWORD br = 0;
     if (!DeviceIoControl(g_hDev, IOCTL_RTW_GET_PIPES, NULL, 0, &g_Pipes, sizeof(g_Pipes), &br, NULL)) {
+        SetStatus("FATAL: IOCTL_RTW_GET_PIPES failed!");
         Print("[FATAL] IOCTL_RTW_GET_PIPES failed!\r\n");
-        SaveLog(); WaitForEnter(); ExitProcess(1);
+        SaveLog();
+        return 1;
     }
     g_NumBulkOut = g_Pipes.NumBulkOut ? g_Pipes.NumBulkOut : 3;
     g_BulkOutMaxPkt = 64;
@@ -1880,18 +1939,20 @@ void mainCRTStartup(void) {
     }
 
     /* 3. Bring up RTL8822BU Radio */
+    SetStatus("Bringing up RTL8822BU radio (Power + FW + MAC + PHY)...");
     Print("[2/6] Bringing up RTL8822BU Radio (Power + FW + MAC + PHY)...\r\n");
     g_CutVer = (u8)((RegRead32(0x00F0) >> 12) & 0xF);
     ReadEfuse();
-    if (!RtwMacPowerOn()) { Print("  [FATAL] PowerOn failed\r\n"); SaveLog(); WaitForEnter(); ExitProcess(1); }
+    if (!RtwMacPowerOn()) { SetStatus("FATAL: Radio PowerOn failed!"); Print("  [FATAL] PowerOn failed\r\n"); SaveLog(); return 1; }
     if (!RtwDownloadFirmware()) { Print("  [WARN] FW boot timeout\r\n"); }
-    if (!RtwMacInit()) { Print("  [FATAL] MacInit failed\r\n"); SaveLog(); WaitForEnter(); ExitProcess(1); }
+    if (!RtwMacInit()) { SetStatus("FATAL: MacInit failed!"); Print("  [FATAL] MacInit failed\r\n"); SaveLog(); return 1; }
     RtwPhySetParam();
     Print("  Radio UP! Cut="); PrintDec(g_CutVer); Print(" RFE="); PrintDec(g_RfeOpt);
     Print(" MgmtPipe="); PrintDec(g_MgmtPipeIdx); Print(" DataPipe="); PrintDec(g_DataPipeIdx); Print("\r\n");
 
-    /* 4. Precompute WPA2 PMK if password supplied (~60ms on Pentium MMX) */
+    /* 4. Precompute WPA2 PMK if password supplied */
     if (g_PasswordLen > 0) {
+        SetStatus("Computing WPA2-PSK PMK (PBKDF2-SHA1)...");
         Print("[3/6] Computing WPA2-PSK PMK (4096x PBKDF2-SHA1)... ");
         pbkdf2_sha1_pmk((const u8 *)g_Password, g_PasswordLen,
                         (const u8 *)g_TargetSsid, g_TargetSsidLen, g_Pmk);
@@ -1900,14 +1961,15 @@ void mainCRTStartup(void) {
         Print("[3/6] Open Wi-Fi mode (no PMK needed)\r\n");
     }
 
-    /* 5. Locate Target AP across 2.4 GHz Channels (hang-proof on empty channels!) */
+    /* 5. Locate Target AP across 2.4 GHz Channels */
+    SetStatus("Scanning 2.4 GHz for target Wi-Fi network...");
     static const u8 scanCh[] = { 1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10 };
     SCAN_CTX sctx;
     sctx.found = 0;
     Print("[4/6] Searching for \""); Print(g_TargetSsid); Print("\"");
-    for (int pass = 0; pass < 2 && !sctx.found; pass++) {
+    for (int pass = 0; pass < 2 && !sctx.found && g_Running; pass++) {
         int chCount = g_ForceCh ? 1 : 11;
-        for (int ci = 0; ci < chCount && !sctx.found; ci++) {
+        for (int ci = 0; ci < chCount && !sctx.found && g_Running; ci++) {
             sctx.curCh = g_ForceCh ? g_ForceCh : scanCh[ci];
             Print(".");
             RtwSetChannel2G(sctx.curCh);
@@ -1916,10 +1978,9 @@ void mainCRTStartup(void) {
             Sleep(15);
             SendProbeReq();
 
-            /* Wait up to 250 ms for any valid frame on this channel before blocking on Bulk IN */
             DWORD tw = GetTickCount();
             int chActive = 0;
-            while ((GetTickCount() - tw) < 250) {
+            while ((GetTickCount() - tw) < 250 && g_Running) {
                 u32 bbNow = (RegRead32(0x0F04) & 0xFFFFU) + (RegRead32(0x0F14) & 0xFFFFU);
                 u32 r284Now = RegRead32(0x0284);
                 if (bbNow != bb0 || r284Now != r284_0) { chActive = 1; break; }
@@ -1928,18 +1989,20 @@ void mainCRTStartup(void) {
             if (!chActive) continue;
 
             DWORD td = GetTickCount();
-            for (int k = 0; k < 20 && !sctx.found && (GetTickCount() - td) < 400; k++) {
+            for (int k = 0; k < 20 && !sctx.found && (GetTickCount() - td) < 400 && g_Running; k++) {
                 PollRxBatch(ScanFrameCb, &sctx);
             }
         }
     }
     Print("\r\n");
+    if (!g_Running) return 0;
     if (!sctx.found) {
+        SetStatus("FATAL: Target SSID not found on 2.4 GHz!");
         Print("  [FATAL] Could not find SSID \""); Print(g_TargetSsid); Print("\" on 2.4 GHz!\r\n");
-        SaveLog(); Print("Press ENTER to exit..."); WaitForEnter(); ExitProcess(1);
+        SaveLog();
+        return 1;
     }
 
-    /* If user supplied no password, force open; if user supplied password, force WPA2 */
     if (g_PasswordLen > 0) g_ApIsWpa2 = 1;
     else if (g_ApIsWpa2) {
         Print("  [WARN] AP advertises WPA2 but no password was given!\r\n");
@@ -1954,87 +2017,102 @@ void mainCRTStartup(void) {
     }
     Print("\r\n");
 
-    /* Tune to AP channel & program Port 0 BSSID + MACID + NET_TYPE=MGD_LINKED */
     RtwSetChannel2G(g_ApChannel);
     for (int i = 0; i < 6; i++) {
         RegWrite8((u16)(0x0610 + i), g_StaMac[i]);
         RegWrite8((u16)(0x0618 + i), g_Bssid[i]);
     }
     RegMask8(0x0102, 0x03, 0x02);      /* RTW_NET_MGD_LINKED */
-    RegWrite32(0x0608, 0xF40022CEU);   /* Filter to our BSSID + unicast/bcast/mcast! */
+    RegWrite32(0x0608, 0xF40022CEU);   /* Filter to our BSSID + unicast/bcast/mcast */
     BatchFlush();
 
     /* 6. 802.11 Authentication + Association */
+    SetStatus("Authenticating & associating with AP...");
     Print("[5/6] Authenticating & Associating...\r\n");
     CONN_CTX cctx;
     cctx.authOk = 0; cctx.assocOk = 0; cctx.status = 0xFFFF;
 
-    for (int tries = 0; tries < 6 && !cctx.authOk; tries++) {
+    for (int tries = 0; tries < 6 && !cctx.authOk && g_Running; tries++) {
         SendAuthReq();
         DWORD t0 = GetTickCount();
-        while ((GetTickCount() - t0) < 500 && !cctx.authOk) {
+        while ((GetTickCount() - t0) < 500 && !cctx.authOk && g_Running) {
             PollRxBatch(ConnFrameCb, &cctx);
         }
     }
     if (!cctx.authOk) {
+        SetStatus("FATAL: 802.11 Authentication failed!");
         Print("  [FATAL] Authentication failed (status="); PrintDec(cctx.status); Print(")\r\n");
-        SaveLog(); Print("Press ENTER to exit..."); WaitForEnter(); ExitProcess(1);
+        SaveLog();
+        return 1;
     }
     Print("  Auth OK!\r\n");
 
-    for (int tries = 0; tries < 6 && !cctx.assocOk; tries++) {
+    for (int tries = 0; tries < 6 && !cctx.assocOk && g_Running; tries++) {
         SendAssocReq();
         DWORD t0 = GetTickCount();
-        while ((GetTickCount() - t0) < 600 && !cctx.assocOk) {
+        while ((GetTickCount() - t0) < 600 && !cctx.assocOk && g_Running) {
             PollRxBatch(ConnFrameCb, &cctx);
         }
     }
     if (!cctx.assocOk) {
+        SetStatus("FATAL: 802.11 Association failed!");
         Print("  [FATAL] Association failed (status="); PrintDec(cctx.status); Print(")\r\n");
-        SaveLog(); Print("Press ENTER to exit..."); WaitForEnter(); ExitProcess(1);
+        SaveLog();
+        return 1;
     }
-    RegMask32(0x06A8, 0x3FFFU, g_Aid); /* Program AID into HW */
+    RegMask32(0x06A8, 0x3FFFU, g_Aid);
     BatchFlush();
     Print("  Associated! AID="); PrintDec(g_Aid); Print("\r\n");
 
-    /* 7. If WPA2-PSK, complete 4-Way Handshake before starting TX data worker */
+    /* 7. WPA2-PSK 4-Way Handshake */
     if (g_ApIsWpa2) {
+        SetStatus("Performing WPA2-PSK 4-Way Handshake...");
         Print("[6/6] Waiting for WPA2 4-Way Handshake (M1..M4)...\r\n");
         DWORD t0 = GetTickCount();
-        while (!g_Encrypted && (GetTickCount() - t0) < 8000) {
+        while (!g_Encrypted && (GetTickCount() - t0) < 8000 && g_Running) {
             PollRxBatch(BridgeRxCb, NULL);
         }
         if (!g_Encrypted) {
+            SetStatus("FATAL: WPA2 4-Way Handshake timed out!");
             Print("  [FATAL] WPA2 4-Way Handshake timed out (state=");
             PrintDec((u32)g_HandshakeState); Print(" eapol="); PrintDec(g_StatEapol); Print(")\r\n");
-            SaveLog(); Print("Press ENTER to exit..."); WaitForEnter(); ExitProcess(1);
+            SaveLog();
+            return 1;
         }
     } else {
         Print("[6/6] Open link UP!\r\n");
     }
 
-    /* Flush any old queued frames from before bridge started, then probe TX mode */
     FlushStaleVxdTx();
     RunTxSelfTest();
 
+    /* Build live status banner */
+    char stBuf[160];
+    stBuf[0] = '\0';
+    StrAppend(stBuf, sizeof(stBuf), "CONNECTED: \"");
+    StrAppend(stBuf, sizeof(stBuf), g_TargetSsid);
+    StrAppend(stBuf, sizeof(stBuf), "\" (CH");
+    StrAppendDec(stBuf, sizeof(stBuf), g_ApChannel);
+    StrAppend(stBuf, sizeof(stBuf), g_ApIsWpa2 ? " WPA2-CCMP, " : " OPEN, ");
+    StrAppend(stBuf, sizeof(stBuf), (g_DataRate == 4U) ? "6 Mbps OFDM)" : "1 Mbps CCK)");
+    StrAppend(stBuf, sizeof(stBuf), " - Safe to minimize!");
+    SetStatus(stBuf);
+
     Print("\r\n=========================================================\r\n");
-    Print("  WI-FI CONNECTED & BRIDGING! Leave this window open!\r\n");
-    Print("  Now open another MS-DOS Prompt and run:\r\n");
-    Print("    ping 192.168.1.1   (or ping 1.1.1.1 / apple.com)\r\n");
+    Print("  WI-FI CONNECTED & BRIDGING IN BACKGROUND!\r\n");
+    Print("  You can minimize this window and open MS-DOS / Browser.\r\n");
     Print("=========================================================\r\n\r\n");
     SaveLog();
 
-    /* Single-threaded TX/RX bridge loop on g_hDev (zero USB handle contention!) */
+    /* Single-threaded TX/RX bridge loop on g_hDev (zero USB contention!) */
     DWORD lastStat = GetTickCount();
     DWORD lastKeepalive = GetTickCount();
     while (g_Running) {
-        /* 1. Drain any outbound frames queued by Windows 95 VTCP.386 */
         if (DrainVxdTx() > 0) lastKeepalive = GetTickCount();
 
-        /* 2. Receive next Bulk IN batch (returns in ~2ms on reply, <=100ms on beacon) */
-        PollRxBatch(BridgeRxCb, NULL);
+        int rxCnt = PollRxBatch(BridgeRxCb, NULL);
+        if (rxCnt == 0) Sleep(5); /* Prevent CPU spin if USB briefly idle/unplugged */
 
-        /* 3. Immediately transmit any synchronous reply VTCP.386 queued during DIOC 3 */
         if (DrainVxdTx() > 0) lastKeepalive = GetTickCount();
 
         DWORD now = GetTickCount();
@@ -2067,8 +2145,152 @@ void mainCRTStartup(void) {
         }
     }
 
-    CloseHandle(g_hDev);
+    if (g_hDev != INVALID_HANDLE_VALUE) CloseHandle(g_hDev);
     if (g_hVxd != INVALID_HANDLE_VALUE) CloseHandle(g_hVxd);
+    SaveLog();
+    return 0;
+}
+
+/* =========================================================================
+ * Native Windows 95 GUI Window (Never Suspended/Throttled in Background!)
+ * ========================================================================= */
+static void UpdateGuiFromWorker(void) {
+    if (g_StatusDirty && g_hStatus) {
+        char tmp[160];
+        EnterCriticalSection(&g_PrintLock);
+        c_copy(tmp, g_StatusText, sizeof(tmp));
+        g_StatusDirty = 0;
+        LeaveCriticalSection(&g_PrintLock);
+        SetWindowTextA(g_hStatus, tmp);
+    }
+
+    if (g_hStats) {
+        char sb[160];
+        sb[0] = '\0';
+        StrAppend(sb, sizeof(sb), "TX: ");       StrAppendDec(sb, sizeof(sb), g_StatTxEth);
+        StrAppend(sb, sizeof(sb), "   |   RX: "); StrAppendDec(sb, sizeof(sb), g_StatRxEth);
+        StrAppend(sb, sizeof(sb), "   |   Ucast: "); StrAppendDec(sb, sizeof(sb), g_StatRxUcast);
+        StrAppend(sb, sizeof(sb), "   |   BCN: ");   StrAppendDec(sb, sizeof(sb), g_StatRxBcn);
+        StrAppend(sb, sizeof(sb), "   |   DecFail: "); StrAppendDec(sb, sizeof(sb), g_StatDecFail);
+        SetWindowTextA(g_hStats, sb);
+    }
+
+    if (g_LogDirty && g_hEdit) {
+        u32 dispLen = 0;
+        EnterCriticalSection(&g_PrintLock);
+        /* Keep last ~12 KB so Win95's 30 KB EDIT control limit is never hit! */
+        u32 start = 0;
+        if (g_LogLen > 12000) {
+            start = g_LogLen - 12000;
+            while (start < g_LogLen && g_LogBuf[start] != '\n') start++;
+            if (start < g_LogLen) start++;
+        }
+        dispLen = g_LogLen - start;
+        if (dispLen >= sizeof(g_DispBuf)) dispLen = sizeof(g_DispBuf) - 1;
+        c_copy(g_DispBuf, g_LogBuf + start, dispLen);
+        g_DispBuf[dispLen] = '\0';
+        g_LogDirty = 0;
+        LeaveCriticalSection(&g_PrintLock);
+
+        SetWindowTextA(g_hEdit, g_DispBuf);
+        SendMessageA(g_hEdit, EM_SETSEL, (WPARAM)dispLen, (LPARAM)dispLen);
+        SendMessageA(g_hEdit, EM_SCROLLCARET, 0, 0);
+    }
+}
+
+static LRESULT CALLBACK BridgeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: {
+            HINSTANCE hInst = GetModuleHandleA(NULL);
+            HFONT hGuiFont  = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT hFixFont  = (HFONT)GetStockObject(ANSI_FIXED_FONT);
+
+            g_hStatus = CreateWindowExA(0, "STATIC", "Starting RTL8822BU Wi-Fi Bridge...",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 8, 530, 18, hwnd, (HMENU)101, hInst, NULL);
+            g_hStats = CreateWindowExA(0, "STATIC", "TX: 0   |   RX: 0   |   Ucast: 0   |   BCN: 0   |   DecFail: 0",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 28, 530, 18, hwnd, (HMENU)102, hInst, NULL);
+            g_hEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                8, 50, 536, 290, hwnd, (HMENU)103, hInst, NULL);
+
+            if (hGuiFont) {
+                SendMessageA(g_hStatus, WM_SETFONT, (WPARAM)hGuiFont, TRUE);
+                SendMessageA(g_hStats,  WM_SETFONT, (WPARAM)hGuiFont, TRUE);
+            }
+            if (hFixFont) {
+                SendMessageA(g_hEdit, WM_SETFONT, (WPARAM)hFixFont, TRUE);
+            }
+            SetTimer(hwnd, 1, 250, NULL);
+            return 0;
+        }
+        case WM_SIZE: {
+            int w = (int)(short)LOWORD(lp);
+            int h = (int)(short)HIWORD(lp);
+            if (w > 20 && h > 70) {
+                if (g_hStatus) MoveWindow(g_hStatus, 10, 8, w - 20, 18, TRUE);
+                if (g_hStats)  MoveWindow(g_hStats,  10, 28, w - 20, 18, TRUE);
+                if (g_hEdit)   MoveWindow(g_hEdit,   8, 50, w - 16, h - 58, TRUE);
+            }
+            return 0;
+        }
+        case WM_TIMER:
+            if (wp == 1) UpdateGuiFromWorker();
+            return 0;
+        case WM_CLOSE:
+            g_Running = 0;
+            KillTimer(hwnd, 1);
+            SaveLog();
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+void WinMainCRTStartup(void) {
+    InitializeCriticalSection(&g_Lock);
+    InitializeCriticalSection(&g_PrintLock);
+    InitializeCriticalSection(&g_VxdLock);
+    InitializeCriticalSection(&g_TxLock);
+
+    /* Ensure Windows 95 NEVER throttles Wi-Fi bridging while IE or DOS is focused! */
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+
+    HINSTANCE hInst = GetModuleHandleA(NULL);
+    WNDCLASSA wc;
+    c_zero(&wc, sizeof(wc));
+    wc.lpfnWndProc   = BridgeWndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = "RTW88Win95Gui";
+    RegisterClassA(&wc);
+
+    g_hWnd = CreateWindowExA(
+        0, "RTW88Win95Gui", "RTL8822BU Win95 Wi-Fi Bridge",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 560, 380,
+        NULL, NULL, hInst, NULL);
+    if (!g_hWnd) ExitProcess(1);
+
+    ShowWindow(g_hWnd, SW_SHOWNORMAL);
+    UpdateWindow(g_hWnd);
+
+    DWORD tid = 0;
+    HANDLE hWorker = CreateThread(NULL, 0, BridgeWorkerThread, NULL, 0, &tid);
+    if (hWorker) {
+        SetThreadPriority(hWorker, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+
+    MSG msg;
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    g_Running = 0;
     SaveLog();
     ExitProcess(0);
 }
