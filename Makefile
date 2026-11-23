@@ -7,7 +7,11 @@ VXD_CFLAGS = -O2 -march=pentium-mmx -mtune=pentium-mmx -mno-stack-arg-probe \
 JWASM ?= /Users/ethan/.gemini/antigravity/brain/8dbb8657-600c-4d8e-9f0c-ae28412df3dc/scratch/tools/jwasm_bin
 JWLINK ?= /Users/ethan/.gemini/antigravity/brain/8dbb8657-600c-4d8e-9f0c-ae28412df3dc/scratch/tools/jwlink_bin
 
-all: RTWPROBE.SYS RTWTEST.EXE AUTOBIND.EXE RTWSCAN.EXE RTW88.VXD VXDDIAG.EXE
+all: RTWPROBE.SYS RTWTEST.EXE AUTOBIND.EXE RTWSCAN.EXE RTW88.VXD TESTVXD.VXD VXDDIAG.EXE
+
+TESTVXD.VXD: testvxd.asm testvxd.lnk
+	$(JWASM) -coff -Cx -Fo testvxd.obj testvxd.asm
+	$(JWLINK) @testvxd.lnk
 
 VXDDIAG.EXE: vxddiag.c
 	$(CC) $(CFLAGS) -nostdlib -e _WinMain@16 -o $@ $< -lkernel32 -luser32 -ladvapi32

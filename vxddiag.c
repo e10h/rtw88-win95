@@ -1,8 +1,7 @@
 /*
  * vxddiag.c - Zero-reboot Windows 95 NDIS & VxD live diagnostic tool
- * Directly tests VXDLDR loading of RTW88.VXD, queries NDIS.VXD status,
- * reads internal RTW88_DIAG telemetry via W32_DEVICEIOCONTROL, and dumps
- * the exact Enum + Services\Class\Net + Services\VxD\NDIS registry state.
+ * Auto-copies TESTVXD.VXD and RTW88.VXD from its own folder into C:\WINDOWS\SYSTEM,
+ * tests VXDLDR loading on BOTH, queries RTW88_DIAG telemetry, and dumps registry.
  */
 #include <windows.h>
 
@@ -59,101 +58,85 @@ static void AppDec(DWORD v) {
     }
 }
 
-static void CheckFile(const char *label, const char *path) {
+static void BuildExeDirPath(char *out, const char *name) {
+    char exe[260];
+    DWORD len = GetModuleFileNameA(NULL, exe, sizeof(exe) - 1);
+    if (len > 0 && len < sizeof(exe)) {
+        exe[len] = '\0';
+        int last = -1, i;
+        for (i = 0; exe[i]; i++) {
+            if (exe[i] == '\\' || exe[i] == '/') last = i;
+        }
+        if (last >= 0) {
+            exe[last + 1] = '\0';
+            lstrcpyA(out, exe);
+            lstrcatA(out, name);
+            return;
+        }
+    }
+    lstrcpyA(out, name);
+}
+
+static void InstallAndCheck(const char *sysDir, const char *name) {
+    char src[260], dst[260];
+    BuildExeDirPath(src, name);
+    lstrcpyA(dst, sysDir);
+    lstrcatA(dst, "\\");
+    lstrcatA(dst, name);
+
+    BOOL copied = CopyFileA(src, dst, FALSE);
+
     WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(path, &fd);
-    AppStr(label);
+    HANDLE h = FindFirstFileA(dst, &fd);
+    AppStr(name);
     AppStr(": ");
     if (h != INVALID_HANDLE_VALUE) {
         FindClose(h);
-        AppStr("OK (");
+        AppStr(copied ? "UPDATED (" : "EXISTS (");
         AppDec(fd.nFileSizeLow);
         AppStr(" bytes)\r\n");
     } else {
-        AppStr("MISSING (err=");
+        AppStr("MISSING (copyErr=");
         AppDec(GetLastError());
         AppStr(")\r\n");
     }
 }
 
-static void DumpRegStr(HKEY hKey, const char *valName) {
-    char buf[160];
-    DWORD len = sizeof(buf) - 1;
-    DWORD type = 0;
-    if (RegQueryValueExA(hKey, valName, NULL, &type, (LPBYTE)buf, &len) == ERROR_SUCCESS) {
-        AppStr("  ");
-        AppStr(valName);
-        AppStr("=");
-        if (type == REG_SZ) {
-            buf[len] = '\0';
-            AppStr(buf);
-        } else {
-            AppStr("(bin len=");
-            AppDec(len);
-            if (len >= 4) { AppStr(" val="); AppHex(*(DWORD*)buf); }
-            else if (len == 1) { AppStr(" val="); AppHex((BYTE)buf[0]); }
-            AppStr(")");
-        }
-        AppStr("\r\n");
-    }
-}
-
-static void DumpRegKey(HKEY root, const char *subPath, const char *title) {
-    HKEY h;
-    AppStr("["); AppStr(title); AppStr("]\r\n");
-    if (RegOpenKeyExA(root, subPath, 0, KEY_READ, &h) != ERROR_SUCCESS) {
-        AppStr("  (key not found)\r\n");
-        return;
-    }
-    DumpRegStr(h, "Class");
-    DumpRegStr(h, "Driver");
-    DumpRegStr(h, "DevLoader");
-    DumpRegStr(h, "DeviceVxDs");
-    DumpRegStr(h, "NTMPDriver");
-    DumpRegStr(h, "StaticVxD");
-    DumpRegStr(h, "DriverDesc");
-    DumpRegStr(h, "MatchingDeviceId");
-    DumpRegStr(h, "ConfigFlags");
-    DumpRegStr(h, "LogDriverName");
-    RegCloseKey(h);
-}
-
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     (void)hInst; (void)hPrev; (void)lpCmd; (void)nShow;
 
-    AppStr("=== RTW88 WIN95 LIVE DIAGNOSTIC ===\r\n");
+    AppStr("=== RTW88 WIN95 LIVE DIAGNOSTIC v2 ===\r\n");
 
     char sysDir[260];
-    char path[300];
     GetSystemDirectoryA(sysDir, sizeof(sysDir));
 
-    path[0] = 0; lstrcpyA(path, sysDir); lstrcatA(path, "\\NDIS.VXD");
-    CheckFile("NDIS.VXD", path);
+    InstallAndCheck(sysDir, "TESTVXD.VXD");
+    InstallAndCheck(sysDir, "RTW88.VXD");
 
-    path[0] = 0; lstrcpyA(path, sysDir); lstrcatA(path, "\\RTW88.VXD");
-    CheckFile("RTW88.VXD", path);
+    /* Test 1: Minimal bare VxD (zero NDIS calls) */
+    AppStr("\r\n[Test 1: \\\\.\\TESTVXD.VXD (bare LE VxD)]\r\n");
+    HANDLE hTest = CreateFileA("\\\\.\\TESTVXD.VXD", 0, 0, NULL, 0, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (hTest == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        AppStr("  FAILED! err="); AppDec(err); AppStr(" ("); AppHex(err); AppStr(")\r\n");
+    } else {
+        AppStr("  LOADED OK! (JWlink LE format is 100% VALID!)\r\n");
+        CloseHandle(hTest);
+    }
 
-    path[0] = 0; lstrcpyA(path, sysDir); lstrcatA(path, "\\VNETSUP.VXD");
-    CheckFile("VNETSUP.VXD", path);
-
-    /* Check if Services\VxD\NDIS exists */
-    DumpRegKey(HKEY_LOCAL_MACHINE, "System\\CurrentControlSet\\Services\\VxD\\NDIS", "Services\\VxD\\NDIS");
-
-    /* Test loading RTW88.VXD directly via VXDLDR! */
-    AppStr("[VXDLDR Test: CreateFile \\\\.\\RTW88.VXD]\r\n");
+    /* Test 2: RTW88.VXD (with NDIS + W32_DEVICEIOCONTROL telemetry) */
+    AppStr("\r\n[Test 2: \\\\.\\RTW88.VXD (NDIS VxD)]\r\n");
     HANDLE hVxd = CreateFileA("\\\\.\\RTW88.VXD", 0, 0, NULL, 0, FILE_FLAG_DELETE_ON_CLOSE, NULL);
     if (hVxd == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
-        AppStr("  FAILED! GetLastError=");
-        AppDec(err);
-        AppStr(" ("); AppHex(err); AppStr(")\r\n");
+        AppStr("  FAILED! err="); AppDec(err); AppStr(" ("); AppHex(err); AppStr(")\r\n");
     } else {
         AppStr("  LOADED OK!\r\n");
         RTW88_DIAG d;
         DWORD cb = 0;
         if (DeviceIoControl(hVxd, 1, NULL, 0, &d, sizeof(d), &cb, NULL)) {
             AppStr("  Magic="); AppHex(d.Magic);
-            AppStr(" InitCalls="); AppDec(d.InitCalls);
+            AppStr(" Init="); AppDec(d.InitCalls);
             AppStr(" NdisCarry="); AppDec(d.NdisGetVerCarry);
             AppStr(" NdisVer="); AppHex(d.NdisVersion); AppStr("\r\n");
             AppStr("  DrvEntry="); AppDec(d.DriverEntryCalls);
@@ -169,49 +152,33 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
         CloseHandle(hVxd);
     }
 
-    /* Dump Enum\USB\VID_0BDA&PID_B812 first instance */
-    HKEY hVid;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Enum\\USB\\VID_0BDA&PID_B812", 0, KEY_READ, &hVid) == ERROR_SUCCESS) {
-        char inst[128];
-        DWORD ilen = sizeof(inst);
-        if (RegEnumKeyExA(hVid, 0, inst, &ilen, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-            char full[256];
-            lstrcpyA(full, "Enum\\USB\\VID_0BDA&PID_B812\\");
-            lstrcatA(full, inst);
-            DumpRegKey(HKEY_LOCAL_MACHINE, full, full);
-
-            /* Also read Driver= and dump that Services\Class key */
-            HKEY hI;
-            if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, full, 0, KEY_READ, &hI) == ERROR_SUCCESS) {
-                char drv[64];
-                DWORD dlen = sizeof(drv);
-                if (RegQueryValueExA(hI, "Driver", NULL, NULL, (LPBYTE)drv, &dlen) == ERROR_SUCCESS) {
-                    char cls[160];
-                    lstrcpyA(cls, "System\\CurrentControlSet\\Services\\Class\\");
-                    lstrcatA(cls, drv);
-                    DumpRegKey(HKEY_LOCAL_MACHINE, cls, cls);
-                    lstrcatA(cls, "\\NDIS");
-                    DumpRegKey(HKEY_LOCAL_MACHINE, cls, "NDIS subkey");
-                }
-                RegCloseKey(hI);
-            }
+    /* Test 3: Also try full path \\.\C:\WINDOWS\SYSTEM\TESTVXD.VXD if short name failed */
+    if (hTest == INVALID_HANDLE_VALUE) {
+        char fullVxd[300];
+        lstrcpyA(fullVxd, "\\\\.\\");
+        lstrcatA(fullVxd, sysDir);
+        lstrcatA(fullVxd, "\\TESTVXD.VXD");
+        AppStr("\r\n[Test 3: "); AppStr(fullVxd); AppStr("]\r\n");
+        HANDLE hFull = CreateFileA(fullVxd, 0, 0, NULL, 0, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        if (hFull == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            AppStr("  FAILED! err="); AppDec(err); AppStr(" ("); AppHex(err); AppStr(")\r\n");
+        } else {
+            AppStr("  LOADED OK!\r\n");
+            CloseHandle(hFull);
         }
-        RegCloseKey(hVid);
-    } else {
-        AppStr("[Enum\\USB\\VID_0BDA&PID_B812] NOT FOUND\r\n");
     }
 
-    /* Also dump Net\0000 and Net\0001 to compare against existing working adapters */
-    DumpRegKey(HKEY_LOCAL_MACHINE, "System\\CurrentControlSet\\Services\\Class\\Net\\0000", "Class\\Net\\0000");
-
-    /* Write DIAG.TXT in current dir */
-    HANDLE hf = CreateFileA("DIAG.TXT", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    /* Save DIAG.TXT next to VXDDIAG.EXE */
+    char diagPath[260];
+    BuildExeDirPath(diagPath, "DIAG.TXT");
+    HANDLE hf = CreateFileA(diagPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf != INVALID_HANDLE_VALUE) {
         DWORD w = 0;
         WriteFile(hf, g_Out, (DWORD)g_Pos, &w, NULL);
         CloseHandle(hf);
     }
 
-    MessageBoxA(NULL, g_Out, "RTW88 Live Diagnostic (saved DIAG.TXT)", MB_OK | MB_ICONINFORMATION);
+    MessageBoxA(NULL, g_Out, "RTW88 Live Diagnostic v2", MB_OK | MB_ICONINFORMATION);
     ExitProcess(0);
 }
