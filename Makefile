@@ -8,7 +8,10 @@ VXD_CFLAGS = -O2 -march=pentium-mmx -mtune=pentium-mmx -mno-stack-arg-probe \
 JWASM ?= /Users/ethan/.gemini/antigravity/brain/8dbb8657-600c-4d8e-9f0c-ae28412df3dc/scratch/tools/jwasm_bin
 JWLINK ?= /Users/ethan/.gemini/antigravity/brain/8dbb8657-600c-4d8e-9f0c-ae28412df3dc/scratch/tools/jwlink_bin
 
-all: RTWPROBE.SYS RTWTEST.EXE AUTOBIND.EXE RTWSCAN.EXE RTW88.VXD TESTVXD.VXD VXDDIAG.EXE PINGTEST.EXE
+all: RTWPROBE.SYS RTWTEST.EXE AUTOBIND.EXE RTWSCAN.EXE RTWBRIDGE.EXE RTW88.VXD TESTVXD.VXD VXDDIAG.EXE PINGTEST.EXE
+
+RTWBRIDGE.EXE: rtwbridge.c wpa2_crypto.h rtw8822b_tables.h
+	$(CC) $(CFLAGS) -nostdlib -e _mainCRTStartup -Wl,--subsystem,console -o $@ rtwbridge.c -lkernel32 -luser32
 
 PINGTEST.EXE: pingtest.c
 	$(CC) $(CFLAGS) -nostdlib -e _mainCRTStartup -Wl,--subsystem,console -o $@ $< -lkernel32 -luser32
