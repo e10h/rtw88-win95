@@ -12,7 +12,7 @@ all: RTWPROBE.SYS RTWTEST.EXE AUTOBIND.EXE RTWSCAN.EXE RTWBRIDGE.EXE RTW88.VXD T
 
 RTWBRIDGE.EXE: rtwbridge.c wpa2_crypto.h rtw8822b_tables.h
 	$(CC) -O2 -march=pentium-mmx -mtune=pentium-mmx -mno-stack-arg-probe -nostdlib -Wall -Wextra \
-	  -o $@ rtwbridge.c -lkernel32 -luser32 -lgdi32 \
+	  -o $@ rtwbridge.c -lkernel32 -luser32 -lgdi32 -lshell32 -ladvapi32 \
 	  -Wl,-e,_WinMainCRTStartup -Wl,--subsystem,windows \
 	  -Xlinker --stack -Xlinker 0x100000,0x40000 \
 	  -Wl,--disable-dynamicbase -Wl,--disable-nxcompat

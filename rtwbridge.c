@@ -15,6 +15,42 @@
 #include "rtw8822b_tables.h"
 #include "wpa2_crypto.h"
 
+/* Exact 88-byte Windows 95 SHELL32.dll NOTIFYICONDATAA (V1 ABI) */
+typedef struct _WIN95_NOTIFYICONDATAA {
+    DWORD cbSize;
+    HWND  hWnd;
+    UINT  uID;
+    UINT  uFlags;
+    UINT  uCallbackMessage;
+    HICON hIcon;
+    char  szTip[64];
+} WIN95_NOTIFYICONDATAA;
+
+#define W95_NIM_ADD         0x00000000
+#define W95_NIM_MODIFY      0x00000001
+#define W95_NIM_DELETE      0x00000002
+#define W95_NIF_MESSAGE     0x00000001
+#define W95_NIF_ICON        0x00000002
+#define W95_NIF_TIP         0x00000004
+#define WM_TRAYICON         (WM_USER + 42)
+#ifndef WM_DEVICECHANGE
+#define WM_DEVICECHANGE     0x0219
+#endif
+
+#define IDC_STATUS          101
+#define IDC_STATS           102
+#define IDC_LOG             103
+#define IDC_SSID            201
+#define IDC_PASS            202
+#define IDC_CONNECT         203
+#define IDC_DISCONN         204
+#define IDC_SHOWPASS        205
+#define IDC_TOTRAY          206
+#define IDC_BOOTWATCH       207
+#define IDC_AUTOCONN        208
+#define IDM_TRAY_OPEN       301
+#define IDM_TRAY_EXIT       302
+
 /* =========================================================================
  * IOCTLs: RTWPROBE.SYS & RTW88.VXD
  * ========================================================================= */
@@ -139,14 +175,31 @@ static volatile int     g_Running = 1;
 static u8               g_ForceCh = 0;
 
 /* Native Win95 GUI Handles & Display Buffers */
-static HWND             g_hWnd    = NULL;
-static HWND             g_hStatus = NULL;
-static HWND             g_hStats  = NULL;
-static HWND             g_hEdit   = NULL;
+static HWND             g_hWnd       = NULL;
+static HWND             g_hStatus    = NULL;
+static HWND             g_hStats     = NULL;
+static HWND             g_hEdit      = NULL;
+static HWND             g_hSsidEdit  = NULL;
+static HWND             g_hPassEdit  = NULL;
+static HWND             g_hBtnConn   = NULL;
+static HWND             g_hBtnDisc   = NULL;
+static HWND             g_hChkShow   = NULL;
+static HWND             g_hBtnTray   = NULL;
+static HWND             g_hChkBoot   = NULL;
+static HWND             g_hChkAuto   = NULL;
+static HICON            g_hAppIcon   = NULL;
 static char             g_StatusText[160];
 static char             g_DispBuf[14000];
-static volatile int     g_LogDirty    = 0;
-static volatile int     g_StatusDirty = 1;
+static volatile int     g_LogDirty     = 0;
+static volatile int     g_StatusDirty  = 1;
+static volatile int     g_WorkerActive = 0;
+static volatile int     g_BridgeStop   = 0;
+static volatile int     g_DongleSeen   = 0;
+static HANDLE           g_hWorker      = NULL;
+static int              g_StartInTray  = 0;
+static int              g_AutoConnect  = 0;
+static int              g_CliConnect   = 0;
+static int              g_TrayAdded    = 0;
 
 /* Hardware Info */
 static u8  g_CutVer        = 0;
@@ -1484,8 +1537,9 @@ static int PollRxBatch(FRAME_CB cb, void *ctx) {
     DWORD br = 0;
     if (!DeviceIoControl(g_hDev, IOCTL_RTW_BULK_RX_RAW,
                          &req, sizeof(req), &g_RxRaw, sizeof(g_RxRaw), &br, NULL)) {
-        return 0;
+        return -1;
     }
+    if (g_RxRaw.Status < 0) return -1;
     if (g_RxRaw.Length < 24) return 0;
 
     u32 off = 0;
@@ -1825,44 +1879,80 @@ static u8 ParseDecU8(const char *s) {
     return (v >= 1 && v <= 14) ? (u8)v : 0;
 }
 
+static int StrEqI(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a++, cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return 0;
+    }
+    return (*a == '\0' && *b == '\0');
+}
+
 static int LoadConfig(void) {
     const char *cmd = GetCommandLineA();
-    char prog[128], chStr[16];
-    chStr[0] = '\0';
+    char prog[128], a1[68], a2[68], a3[16];
+    a1[0] = a2[0] = a3[0] = '\0';
     cmd = ParseArg(cmd, prog, sizeof(prog));
-    cmd = ParseArg(cmd, g_TargetSsid, sizeof(g_TargetSsid));
-    cmd = ParseArg(cmd, g_Password, sizeof(g_Password));
-    cmd = ParseArg(cmd, chStr, sizeof(chStr));
-    g_ForceCh = ParseDecU8(chStr);
+    cmd = ParseArg(cmd, a1, sizeof(a1));
+    if (StrEqI(a1, "/tray") || StrEqI(a1, "-tray")) {
+        g_StartInTray = 1;
+        a1[0] = '\0';
+        cmd = ParseArg(cmd, a1, sizeof(a1));
+    }
+    cmd = ParseArg(cmd, a2, sizeof(a2));
+    cmd = ParseArg(cmd, a3, sizeof(a3));
+
+    if (a1[0] != '\0') {
+        g_TargetSsid[0] = '\0'; StrAppend(g_TargetSsid, sizeof(g_TargetSsid), a1);
+        g_Password[0] = '\0';   StrAppend(g_Password, sizeof(g_Password), a2);
+        g_ForceCh = ParseDecU8(a3);
+        g_CliConnect = 1;
+    }
 
     if (g_TargetSsid[0] == '\0') {
         HANDLE h = OpenLocalFileRead("WIFI.TXT");
         if (h != INVALID_HANDLE_VALUE) {
-            char buf[256];
+            char buf[320];
             DWORD br = 0;
             ReadFile(h, buf, sizeof(buf) - 1, &br, NULL);
             CloseHandle(h);
             buf[br] = '\0';
 
-            /* Line 1 = SSID, Line 2 = Password (optional), Line 3 = Channel (optional) */
+            /* Line 1 = SSID, Line 2 = Password, Line 3 = Channel (optional), Line 4 = AUTO=1/0 */
             u32 p = 0, i = 0;
             while (buf[p] && buf[p] != '\r' && buf[p] != '\n' && i + 1 < sizeof(g_TargetSsid)) {
                 g_TargetSsid[i++] = buf[p++];
             }
             g_TargetSsid[i] = '\0';
-            while (buf[p] == '\r' || buf[p] == '\n') p++;
+            if (buf[p] == '\r') p++;
+            if (buf[p] == '\n') p++;
+
             i = 0;
             while (buf[p] && buf[p] != '\r' && buf[p] != '\n' && i + 1 < sizeof(g_Password)) {
                 g_Password[i++] = buf[p++];
             }
             g_Password[i] = '\0';
-            while (buf[p] == '\r' || buf[p] == '\n') p++;
+            if (buf[p] == '\r') p++;
+            if (buf[p] == '\n') p++;
+
+            char chStr[16];
             i = 0;
             while (buf[p] && buf[p] != '\r' && buf[p] != '\n' && i + 1 < sizeof(chStr)) {
                 chStr[i++] = buf[p++];
             }
             chStr[i] = '\0';
             g_ForceCh = ParseDecU8(chStr);
+            if (buf[p] == '\r') p++;
+            if (buf[p] == '\n') p++;
+
+            char autoStr[16];
+            i = 0;
+            while (buf[p] && buf[p] != '\r' && buf[p] != '\n' && i + 1 < sizeof(autoStr)) {
+                autoStr[i++] = buf[p++];
+            }
+            autoStr[i] = '\0';
+            if (StrEqI(autoStr, "AUTO=1") || StrEqI(autoStr, "1")) g_AutoConnect = 1;
         }
     }
 
@@ -1871,23 +1961,103 @@ static int LoadConfig(void) {
     return (g_TargetSsidLen > 0) ? 1 : 0;
 }
 
+static void SaveWifiConfig(void) {
+    char path[300];
+    BuildExeDirPath(path, sizeof(path), "WIFI.TXT");
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        h = CreateFileA("WIFI.TXT", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    char buf[256];
+    buf[0] = '\0';
+    StrAppend(buf, sizeof(buf), g_TargetSsid);
+    StrAppend(buf, sizeof(buf), "\r\n");
+    StrAppend(buf, sizeof(buf), g_Password);
+    StrAppend(buf, sizeof(buf), "\r\n");
+    if (g_ForceCh >= 1 && g_ForceCh <= 14) {
+        StrAppendDec(buf, sizeof(buf), g_ForceCh);
+    }
+    StrAppend(buf, sizeof(buf), "\r\n");
+    StrAppend(buf, sizeof(buf), g_AutoConnect ? "AUTO=1\r\n" : "AUTO=0\r\n");
+    DWORD w = 0;
+    WriteFile(h, buf, StrLen(buf), &w, NULL);
+    CloseHandle(h);
+}
+
+/* =========================================================================
+ * Windows 95 Registry Auto-Start (Run in System Tray at Boot)
+ * ========================================================================= */
+static const char g_RunKeyPath[] = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const char g_RunValName[] = "RTW88WiFi";
+
+static int IsBootAutoStartEnabled(void) {
+    HKEY hk = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, g_RunKeyPath, 0, KEY_READ, &hk) != ERROR_SUCCESS) {
+        return 0;
+    }
+    char val[320];
+    DWORD sz = sizeof(val), ty = 0;
+    LONG r = RegQueryValueExA(hk, g_RunValName, NULL, &ty, (LPBYTE)val, &sz);
+    RegCloseKey(hk);
+    return (r == ERROR_SUCCESS && sz > 1) ? 1 : 0;
+}
+
+static void SetBootAutoStart(int enable) {
+    HKEY hk = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, g_RunKeyPath, 0, KEY_WRITE, &hk) != ERROR_SUCCESS) {
+        return;
+    }
+    if (enable) {
+        char exe[260], cmd[300];
+        DWORD len = GetModuleFileNameA(NULL, exe, sizeof(exe) - 1);
+        if (len > 0 && len < sizeof(exe)) {
+            exe[len] = '\0';
+            cmd[0] = '\0';
+            StrAppend(cmd, sizeof(cmd), "\"");
+            StrAppend(cmd, sizeof(cmd), exe);
+            StrAppend(cmd, sizeof(cmd), "\" /tray");
+            RegSetValueExA(hk, g_RunValName, 0, REG_SZ, (const BYTE *)cmd, StrLen(cmd) + 1);
+            Print("[AUTO-START] Enabled! RTWBRIDGE will sit in Tray at boot and pop up on USB plug-in.\r\n");
+        }
+    } else {
+        RegDeleteValueA(hk, g_RunValName);
+        Print("[AUTO-START] Disabled.\r\n");
+    }
+    RegCloseKey(hk);
+}
+
 /* =========================================================================
  * Single-Threaded USB Bridge Worker (Runs in Native Win95 GUI Background!)
  * ========================================================================= */
 static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
     (void)param;
+    g_WorkerActive = 1;
+    g_BridgeStop   = 0;
+
+    /* Reset per-connection crypto & counter state cleanly for reconnects */
+    g_Encrypted      = 0;
+    g_HandshakeState = 0;
+    g_ApIsWpa2       = 0;
+    g_ApChannel      = 0;
+    g_Aid            = 0;
+    g_TxPnLo         = 1;
+    g_TxPnHi         = 0;
+    g_Batch.Count    = 0;
+    for (int i = 0; i < 4; i++) g_GtkValid[i] = 0;
+    g_StatTxEth = g_StatRxEth = g_StatRxBcn = g_StatDecFail = 0;
+    g_StatEapol = g_StatTxEcho = g_StatRxUcast = 0;
 
     Print("=========================================================\r\n");
     Print("  RTL8822BU Win95 Wi-Fi Bridge (Native GUI + WPA2-CCMP)\r\n");
     Print("=========================================================\r\n");
 
-    if (!LoadConfig()) {
-        SetStatus("Error: WIFI.TXT not found (Line 1 = SSID, Line 2 = Password)");
-        Print("\r\nUsage:\r\n");
-        Print("  RTWBRIDGE.EXE \"SSID\"             (Open Wi-Fi)\r\n");
-        Print("  RTWBRIDGE.EXE \"SSID\" \"PASSWORD\"  (WPA2-PSK Wi-Fi)\r\n");
-        Print("  Or create WIFI.TXT in this folder:\r\n");
-        Print("    Line 1 = SSID\r\n    Line 2 = Password\r\n    Line 3 = Channel (optional)\r\n");
+    g_TargetSsidLen = StrLen(g_TargetSsid);
+    g_PasswordLen   = StrLen(g_Password);
+    if (g_TargetSsidLen == 0) {
+        SetStatus("Enter a Wi-Fi Name (SSID) above and click Connect.");
+        g_WorkerActive = 0;
         return 1;
     }
 
@@ -1915,18 +2085,17 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
     g_hDev = CreateFileA("\\\\.\\RTWPROBE", GENERIC_READ | GENERIC_WRITE,
                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (g_hDev == INVALID_HANDLE_VALUE) {
-        SetStatus("FATAL: Cannot open \\\\.\\RTWPROBE (plug in USB Wi-Fi dongle!)");
-        Print("[FATAL] Cannot open \\\\.\\RTWPROBE (err="); PrintDec(GetLastError()); Print(")\r\n");
-        SaveLog();
-        return 1;
+        SetStatus("USB Wi-Fi dongle not detected - plug it in and click Connect!");
+        Print("[WARN] Cannot open \\\\.\\RTWPROBE (err="); PrintDec(GetLastError()); Print(")\r\n");
+        goto cleanup;
     }
+    g_DongleSeen = 1;
 
     DWORD br = 0;
     if (!DeviceIoControl(g_hDev, IOCTL_RTW_GET_PIPES, NULL, 0, &g_Pipes, sizeof(g_Pipes), &br, NULL)) {
-        SetStatus("FATAL: IOCTL_RTW_GET_PIPES failed!");
+        SetStatus("ERROR: IOCTL_RTW_GET_PIPES failed!");
         Print("[FATAL] IOCTL_RTW_GET_PIPES failed!\r\n");
-        SaveLog();
-        return 1;
+        goto cleanup;
     }
     g_NumBulkOut = g_Pipes.NumBulkOut ? g_Pipes.NumBulkOut : 3;
     g_BulkOutMaxPkt = 64;
@@ -1943,7 +2112,7 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
     Print("[2/6] Bringing up RTL8822BU Radio (Power + FW + MAC + PHY)...\r\n");
     g_CutVer = (u8)((RegRead32(0x00F0) >> 12) & 0xF);
     ReadEfuse();
-    if (!RtwMacPowerOn()) { SetStatus("FATAL: Radio PowerOn failed!"); Print("  [FATAL] PowerOn failed\r\n"); SaveLog(); return 1; }
+    if (!RtwMacPowerOn()) { SetStatus("ERROR: Radio PowerOn failed!"); Print("  [FATAL] PowerOn failed\r\n"); goto cleanup; }
     if (!RtwDownloadFirmware()) {
         Print("  [INFO] Retrying FW download after clean power-cycle...\r\n");
         PowerSwitch(0);
@@ -1953,10 +2122,11 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
             Print("  [WARN] FW boot timeout\r\n");
         }
     }
-    if (!RtwMacInit()) { SetStatus("FATAL: MacInit failed!"); Print("  [FATAL] MacInit failed\r\n"); SaveLog(); return 1; }
+    if (!RtwMacInit()) { SetStatus("ERROR: MacInit failed!"); Print("  [FATAL] MacInit failed\r\n"); goto cleanup; }
     RtwPhySetParam();
     Print("  Radio UP! Cut="); PrintDec(g_CutVer); Print(" RFE="); PrintDec(g_RfeOpt);
     Print(" MgmtPipe="); PrintDec(g_MgmtPipeIdx); Print(" DataPipe="); PrintDec(g_DataPipeIdx); Print("\r\n");
+    if (!g_Running || g_BridgeStop) goto cleanup;
 
     /* 4. Precompute WPA2 PMK if password supplied */
     if (g_PasswordLen > 0) {
@@ -1968,6 +2138,7 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
     } else {
         Print("[3/6] Open Wi-Fi mode (no PMK needed)\r\n");
     }
+    if (!g_Running || g_BridgeStop) goto cleanup;
 
     /* 5. Locate Target AP across 2.4 GHz Channels */
     SetStatus("Scanning 2.4 GHz for target Wi-Fi network...");
@@ -1975,9 +2146,9 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
     SCAN_CTX sctx;
     sctx.found = 0;
     Print("[4/6] Searching for \""); Print(g_TargetSsid); Print("\"");
-    for (int pass = 0; pass < 2 && !sctx.found && g_Running; pass++) {
+    for (int pass = 0; pass < 2 && !sctx.found && g_Running && !g_BridgeStop; pass++) {
         int chCount = g_ForceCh ? 1 : 11;
-        for (int ci = 0; ci < chCount && !sctx.found && g_Running; ci++) {
+        for (int ci = 0; ci < chCount && !sctx.found && g_Running && !g_BridgeStop; ci++) {
             sctx.curCh = g_ForceCh ? g_ForceCh : scanCh[ci];
             Print(".");
             RtwSetChannel2G(sctx.curCh);
@@ -1988,7 +2159,7 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
 
             DWORD tw = GetTickCount();
             int chActive = 0;
-            while ((GetTickCount() - tw) < 250 && g_Running) {
+            while ((GetTickCount() - tw) < 250 && g_Running && !g_BridgeStop) {
                 u32 bbNow = (RegRead32(0x0F04) & 0xFFFFU) + (RegRead32(0x0F14) & 0xFFFFU);
                 u32 r284Now = RegRead32(0x0284);
                 if (bbNow != bb0 || r284Now != r284_0) { chActive = 1; break; }
@@ -1997,18 +2168,17 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
             if (!chActive) continue;
 
             DWORD td = GetTickCount();
-            for (int k = 0; k < 20 && !sctx.found && (GetTickCount() - td) < 400 && g_Running; k++) {
-                PollRxBatch(ScanFrameCb, &sctx);
+            for (int k = 0; k < 20 && !sctx.found && (GetTickCount() - td) < 400 && g_Running && !g_BridgeStop; k++) {
+                if (PollRxBatch(ScanFrameCb, &sctx) < 0) { g_BridgeStop = 1; break; }
             }
         }
     }
     Print("\r\n");
-    if (!g_Running) return 0;
+    if (!g_Running || g_BridgeStop) goto cleanup;
     if (!sctx.found) {
-        SetStatus("FATAL: Target SSID not found on 2.4 GHz!");
-        Print("  [FATAL] Could not find SSID \""); Print(g_TargetSsid); Print("\" on 2.4 GHz!\r\n");
-        SaveLog();
-        return 1;
+        SetStatus("Could not find that Wi-Fi SSID on 2.4 GHz (check name & retry).");
+        Print("  [ERROR] Could not find SSID \""); Print(g_TargetSsid); Print("\" on 2.4 GHz!\r\n");
+        goto cleanup;
     }
 
     if (g_PasswordLen > 0) g_ApIsWpa2 = 1;
@@ -2040,33 +2210,31 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
     CONN_CTX cctx;
     cctx.authOk = 0; cctx.assocOk = 0; cctx.status = 0xFFFF;
 
-    for (int tries = 0; tries < 6 && !cctx.authOk && g_Running; tries++) {
+    for (int tries = 0; tries < 6 && !cctx.authOk && g_Running && !g_BridgeStop; tries++) {
         SendAuthReq();
         DWORD t0 = GetTickCount();
-        while ((GetTickCount() - t0) < 500 && !cctx.authOk && g_Running) {
-            PollRxBatch(ConnFrameCb, &cctx);
+        while ((GetTickCount() - t0) < 500 && !cctx.authOk && g_Running && !g_BridgeStop) {
+            if (PollRxBatch(ConnFrameCb, &cctx) < 0) { g_BridgeStop = 1; break; }
         }
     }
     if (!cctx.authOk) {
-        SetStatus("FATAL: 802.11 Authentication failed!");
-        Print("  [FATAL] Authentication failed (status="); PrintDec(cctx.status); Print(")\r\n");
-        SaveLog();
-        return 1;
+        SetStatus("ERROR: 802.11 Authentication failed!");
+        Print("  [ERROR] Authentication failed (status="); PrintDec(cctx.status); Print(")\r\n");
+        goto cleanup;
     }
     Print("  Auth OK!\r\n");
 
-    for (int tries = 0; tries < 6 && !cctx.assocOk && g_Running; tries++) {
+    for (int tries = 0; tries < 6 && !cctx.assocOk && g_Running && !g_BridgeStop; tries++) {
         SendAssocReq();
         DWORD t0 = GetTickCount();
-        while ((GetTickCount() - t0) < 600 && !cctx.assocOk && g_Running) {
-            PollRxBatch(ConnFrameCb, &cctx);
+        while ((GetTickCount() - t0) < 600 && !cctx.assocOk && g_Running && !g_BridgeStop) {
+            if (PollRxBatch(ConnFrameCb, &cctx) < 0) { g_BridgeStop = 1; break; }
         }
     }
     if (!cctx.assocOk) {
-        SetStatus("FATAL: 802.11 Association failed!");
-        Print("  [FATAL] Association failed (status="); PrintDec(cctx.status); Print(")\r\n");
-        SaveLog();
-        return 1;
+        SetStatus("ERROR: 802.11 Association failed!");
+        Print("  [ERROR] Association failed (status="); PrintDec(cctx.status); Print(")\r\n");
+        goto cleanup;
     }
     RegMask32(0x06A8, 0x3FFFU, g_Aid);
     BatchFlush();
@@ -2077,15 +2245,14 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
         SetStatus("Performing WPA2-PSK 4-Way Handshake...");
         Print("[6/6] Waiting for WPA2 4-Way Handshake (M1..M4)...\r\n");
         DWORD t0 = GetTickCount();
-        while (!g_Encrypted && (GetTickCount() - t0) < 8000 && g_Running) {
-            PollRxBatch(BridgeRxCb, NULL);
+        while (!g_Encrypted && (GetTickCount() - t0) < 8000 && g_Running && !g_BridgeStop) {
+            if (PollRxBatch(BridgeRxCb, NULL) < 0) { g_BridgeStop = 1; break; }
         }
         if (!g_Encrypted) {
-            SetStatus("FATAL: WPA2 4-Way Handshake timed out!");
-            Print("  [FATAL] WPA2 4-Way Handshake timed out (state=");
+            SetStatus("WPA2 handshake failed (wrong password?) - edit & retry.");
+            Print("  [ERROR] WPA2 4-Way Handshake timed out (state=");
             PrintDec((u32)g_HandshakeState); Print(" eapol="); PrintDec(g_StatEapol); Print(")\r\n");
-            SaveLog();
-            return 1;
+            goto cleanup;
         }
     } else {
         Print("[6/6] Open link UP!\r\n");
@@ -2103,26 +2270,37 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
     StrAppendDec(stBuf, sizeof(stBuf), g_ApChannel);
     StrAppend(stBuf, sizeof(stBuf), g_ApIsWpa2 ? " WPA2-CCMP, " : " OPEN, ");
     StrAppend(stBuf, sizeof(stBuf), (g_DataRate == 4U) ? "6 Mbps OFDM)" : "1 Mbps CCK)");
-    StrAppend(stBuf, sizeof(stBuf), " - Safe to minimize!");
     SetStatus(stBuf);
 
     Print("\r\n=========================================================\r\n");
     Print("  WI-FI CONNECTED & BRIDGING IN BACKGROUND!\r\n");
-    Print("  You can minimize this window and open MS-DOS / Browser.\r\n");
+    Print("  Click 'Hide to Tray' or minimize and browse the web!\r\n");
     Print("=========================================================\r\n\r\n");
     SaveLog();
 
-    /* Boost worker thread slightly only during active packet bridging (after init!) */
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     /* Single-threaded TX/RX bridge loop on g_hDev (zero USB contention!) */
     DWORD lastStat = GetTickCount();
     DWORD lastKeepalive = GetTickCount();
-    while (g_Running) {
+    int usbErrStreak = 0;
+    while (g_Running && !g_BridgeStop) {
         if (DrainVxdTx() > 0) lastKeepalive = GetTickCount();
 
         int rxCnt = PollRxBatch(BridgeRxCb, NULL);
-        if (rxCnt == 0) Sleep(5); /* Prevent CPU spin if USB briefly idle/unplugged */
+        if (rxCnt < 0) {
+            usbErrStreak++;
+            if (usbErrStreak >= 3) {
+                Print("[INFO] USB Wi-Fi dongle unplugged!\r\n");
+                SetStatus("USB Wi-Fi dongle unplugged - waiting for plug-in...");
+                g_DongleSeen = 0;
+                break;
+            }
+            Sleep(25);
+        } else {
+            usbErrStreak = 0;
+            if (rxCnt == 0) Sleep(5);
+        }
 
         if (DrainVxdTx() > 0) lastKeepalive = GetTickCount();
 
@@ -2156,16 +2334,124 @@ static DWORD WINAPI BridgeWorkerThread(LPVOID param) {
         }
     }
 
-    if (g_hDev != INVALID_HANDLE_VALUE) CloseHandle(g_hDev);
-    if (g_hVxd != INVALID_HANDLE_VALUE) CloseHandle(g_hVxd);
+cleanup:
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+    if (g_hDev != INVALID_HANDLE_VALUE) { CloseHandle(g_hDev); g_hDev = INVALID_HANDLE_VALUE; }
+    if (g_hVxd != INVALID_HANDLE_VALUE) { CloseHandle(g_hVxd); g_hVxd = INVALID_HANDLE_VALUE; }
+    if (g_BridgeStop && g_Running) {
+        SetStatus("Disconnected. Enter Wi-Fi Name & Password and click Connect.");
+        Print("[INFO] Disconnected.\r\n");
+    }
     SaveLog();
+    g_WorkerActive = 0;
     return 0;
 }
 
 /* =========================================================================
- * Native Windows 95 GUI Window (Never Suspended/Throttled in Background!)
+ * System Tray, USB Plug-In Watcher & Native Windows 95 Wi-Fi Dialog
  * ========================================================================= */
+static void UpdateTrayIcon(int op, const char *tip) {
+    if (!g_hWnd) return;
+    WIN95_NOTIFYICONDATAA nid;
+    c_zero(&nid, sizeof(nid));
+    nid.cbSize = sizeof(nid); /* Strictly 88 bytes for Windows 95 SHELL32.dll! */
+    nid.hWnd   = g_hWnd;
+    nid.uID    = 1;
+    nid.uFlags = W95_NIF_MESSAGE | W95_NIF_ICON | W95_NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon  = g_hAppIcon;
+    if (tip) {
+        nid.szTip[0] = '\0';
+        StrAppend(nid.szTip, sizeof(nid.szTip), tip);
+    }
+    Shell_NotifyIconA((DWORD)op, (PNOTIFYICONDATAA)&nid);
+    if (op == W95_NIM_ADD) g_TrayAdded = 1;
+    else if (op == W95_NIM_DELETE) g_TrayAdded = 0;
+}
+
+static int ProbeUsbDongle(void) {
+    HANDLE h = CreateFileA("\\\\.\\RTWPROBE", GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    CloseHandle(h);
+    return 1;
+}
+
+static void ShowAndFocusMainWindow(void) {
+    if (!g_hWnd) return;
+    ShowWindow(g_hWnd, SW_SHOWNORMAL);
+    ShowWindow(g_hWnd, SW_RESTORE);
+    SetForegroundWindow(g_hWnd);
+}
+
+static void SyncControlEnableState(void) {
+    BOOL busy = g_WorkerActive ? TRUE : FALSE;
+    if (g_hSsidEdit) EnableWindow(g_hSsidEdit, !busy);
+    if (g_hPassEdit) EnableWindow(g_hPassEdit, !busy);
+    if (g_hBtnConn)  EnableWindow(g_hBtnConn,  !busy);
+    if (g_hBtnDisc)  EnableWindow(g_hBtnDisc,  busy);
+}
+
+static void StartBridgeFromUi(void) {
+    if (g_WorkerActive) return;
+
+    if (g_hSsidEdit) GetWindowTextA(g_hSsidEdit, g_TargetSsid, sizeof(g_TargetSsid));
+    if (g_hPassEdit) GetWindowTextA(g_hPassEdit, g_Password, sizeof(g_Password));
+    g_TargetSsidLen = StrLen(g_TargetSsid);
+    g_PasswordLen   = StrLen(g_Password);
+    if (g_TargetSsidLen == 0) {
+        SetStatus("Please enter a Wi-Fi Name (SSID) first!");
+        if (g_hSsidEdit) SetFocus(g_hSsidEdit);
+        return;
+    }
+
+    /* Save SSID / Password / Auto-connect preference to WIFI.TXT */
+    SaveWifiConfig();
+
+    if (g_hWorker) { CloseHandle(g_hWorker); g_hWorker = NULL; }
+    g_WorkerActive = 1;
+    g_BridgeStop   = 0;
+    SyncControlEnableState();
+
+    DWORD tid = 0;
+    g_hWorker = CreateThread(NULL, 0x40000, BridgeWorkerThread, NULL, 0, &tid);
+    if (!g_hWorker) {
+        g_WorkerActive = 0;
+        SyncControlEnableState();
+        SetStatus("ERROR: CreateThread failed!");
+    }
+}
+
+static void StopBridgeFromUi(void) {
+    if (!g_WorkerActive) return;
+    g_BridgeStop = 1;
+    SetStatus("Disconnecting...");
+}
+
+static void PollUsbPlugIn(void) {
+    if (g_WorkerActive) return; /* Never probe while worker owns \\.\RTWPROBE */
+    int nowPresent = ProbeUsbDongle();
+    if (nowPresent && !g_DongleSeen) {
+        g_DongleSeen = 1;
+        Print("[USB] RTL8822BU Wi-Fi dongle plugged in!\r\n");
+        SetStatus("USB Wi-Fi dongle plugged in! Enter Wi-Fi Name & Password -> Connect.");
+        UpdateTrayIcon(W95_NIM_MODIFY, "RTL8822BU Wi-Fi: Dongle Ready");
+        ShowAndFocusMainWindow();
+        if (g_AutoConnect && StrLen(g_TargetSsid) > 0) {
+            StartBridgeFromUi();
+        } else if (g_hSsidEdit) {
+            SetFocus(g_hSsidEdit);
+        }
+    } else if (!nowPresent && g_DongleSeen) {
+        g_DongleSeen = 0;
+        SetStatus("Waiting for RTL8822BU USB Wi-Fi dongle (plug it in!)...");
+        UpdateTrayIcon(W95_NIM_MODIFY, "RTL8822BU Wi-Fi: Waiting for USB dongle");
+    }
+}
+
 static void UpdateGuiFromWorker(void) {
+    SyncControlEnableState();
+
     if (g_StatusDirty && g_hStatus) {
         char tmp[160];
         EnterCriticalSection(&g_PrintLock);
@@ -2173,6 +2459,12 @@ static void UpdateGuiFromWorker(void) {
         g_StatusDirty = 0;
         LeaveCriticalSection(&g_PrintLock);
         SetWindowTextA(g_hStatus, tmp);
+        if (g_TrayAdded) {
+            char tip[64];
+            tip[0] = '\0';
+            StrAppend(tip, sizeof(tip), tmp);
+            UpdateTrayIcon(W95_NIM_MODIFY, tip);
+        }
     }
 
     if (g_hStats) {
@@ -2209,6 +2501,26 @@ static void UpdateGuiFromWorker(void) {
     }
 }
 
+static void LayoutControls(int w, int h) {
+    if (w < 320 || h < 180) return;
+    int editW = w - 285;
+    if (editW < 100) editW = 100;
+    int btnX1 = 105 + editW + 8;
+    int btnX2 = btnX1 + 82;
+
+    if (g_hSsidEdit) MoveWindow(g_hSsidEdit, 105,  8, editW, 21, TRUE);
+    if (g_hPassEdit) MoveWindow(g_hPassEdit, 105, 34, editW, 21, TRUE);
+    if (g_hBtnConn)  MoveWindow(g_hBtnConn,  btnX1,  7, 76, 23, TRUE);
+    if (g_hBtnDisc)  MoveWindow(g_hBtnDisc,  btnX2,  7, 82, 23, TRUE);
+    if (g_hChkShow)  MoveWindow(g_hChkShow,  btnX1, 35, 76, 20, TRUE);
+    if (g_hBtnTray)  MoveWindow(g_hBtnTray,  btnX2, 33, 82, 23, TRUE);
+    if (g_hChkBoot)  MoveWindow(g_hChkBoot,  10,  62, 340, 18, TRUE);
+    if (g_hChkAuto)  MoveWindow(g_hChkAuto,  355, 62, 195, 18, TRUE);
+    if (g_hStatus)   MoveWindow(g_hStatus,   10,  86, w - 20, 18, TRUE);
+    if (g_hStats)    MoveWindow(g_hStats,    10, 106, w - 20, 18, TRUE);
+    if (g_hEdit)     MoveWindow(g_hEdit,      8, 128, w - 16, h - 136, TRUE);
+}
+
 static LRESULT CALLBACK BridgeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
@@ -2216,40 +2528,139 @@ static LRESULT CALLBACK BridgeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HFONT hGuiFont  = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
             HFONT hFixFont  = (HFONT)GetStockObject(ANSI_FIXED_FONT);
 
-            g_hStatus = CreateWindowExA(0, "STATIC", "Starting RTL8822BU Wi-Fi Bridge...",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 8, 530, 18, hwnd, (HMENU)101, hInst, NULL);
+            HWND hLblSsid = CreateWindowExA(0, "STATIC", "Wi-Fi Name:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 11, 90, 18, hwnd, NULL, hInst, NULL);
+            HWND hLblPass = CreateWindowExA(0, "STATIC", "Password:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 37, 90, 18, hwnd, NULL, hInst, NULL);
+
+            g_hSsidEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", g_TargetSsid,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                105, 8, 250, 21, hwnd, (HMENU)IDC_SSID, hInst, NULL);
+            g_hPassEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", g_Password,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
+                105, 34, 250, 21, hwnd, (HMENU)IDC_PASS, hInst, NULL);
+
+            g_hBtnConn = CreateWindowExA(0, "BUTTON", "Connect",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                363, 7, 76, 23, hwnd, (HMENU)IDC_CONNECT, hInst, NULL);
+            g_hBtnDisc = CreateWindowExA(0, "BUTTON", "Disconnect",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | WS_DISABLED,
+                445, 7, 82, 23, hwnd, (HMENU)IDC_DISCONN, hInst, NULL);
+
+            g_hChkShow = CreateWindowExA(0, "BUTTON", "Show",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                363, 35, 76, 20, hwnd, (HMENU)IDC_SHOWPASS, hInst, NULL);
+            g_hBtnTray = CreateWindowExA(0, "BUTTON", "Hide to Tray",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                445, 33, 82, 23, hwnd, (HMENU)IDC_TOTRAY, hInst, NULL);
+
+            g_hChkBoot = CreateWindowExA(0, "BUTTON", "Run in Tray at boot (auto-open on USB plug-in)",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                10, 62, 340, 18, hwnd, (HMENU)IDC_BOOTWATCH, hInst, NULL);
+            g_hChkAuto = CreateWindowExA(0, "BUTTON", "Auto-connect on plug-in",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                355, 62, 195, 18, hwnd, (HMENU)IDC_AUTOCONN, hInst, NULL);
+
+            g_hStatus = CreateWindowExA(0, "STATIC", "Ready. Plug in USB Wi-Fi dongle and click Connect.",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 86, 530, 18, hwnd, (HMENU)IDC_STATUS, hInst, NULL);
             g_hStats = CreateWindowExA(0, "STATIC", "TX: 0   |   RX: 0   |   Ucast: 0   |   BCN: 0   |   DecFail: 0",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 28, 530, 18, hwnd, (HMENU)102, hInst, NULL);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 106, 530, 18, hwnd, (HMENU)IDC_STATS, hInst, NULL);
             g_hEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                8, 50, 536, 290, hwnd, (HMENU)103, hInst, NULL);
+                8, 128, 536, 260, hwnd, (HMENU)IDC_LOG, hInst, NULL);
 
             if (hGuiFont) {
-                SendMessageA(g_hStatus, WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-                SendMessageA(g_hStats,  WM_SETFONT, (WPARAM)hGuiFont, TRUE);
+                HWND ctrls[] = { hLblSsid, hLblPass, g_hSsidEdit, g_hPassEdit,
+                                 g_hBtnConn, g_hBtnDisc, g_hChkShow, g_hBtnTray,
+                                 g_hChkBoot, g_hChkAuto, g_hStatus, g_hStats };
+                for (int i = 0; i < (int)(sizeof(ctrls) / sizeof(ctrls[0])); i++) {
+                    if (ctrls[i]) SendMessageA(ctrls[i], WM_SETFONT, (WPARAM)hGuiFont, TRUE);
+                }
             }
-            if (hFixFont) {
+            if (hFixFont && g_hEdit) {
                 SendMessageA(g_hEdit, WM_SETFONT, (WPARAM)hFixFont, TRUE);
             }
-            SetTimer(hwnd, 1, 250, NULL);
+
+            if (IsBootAutoStartEnabled()) {
+                SendMessageA(g_hChkBoot, BM_SETCHECK, BST_CHECKED, 0);
+            }
+            if (g_AutoConnect) {
+                SendMessageA(g_hChkAuto, BM_SETCHECK, BST_CHECKED, 0);
+            }
+
+            SetTimer(hwnd, 1, 250, NULL);   /* UI log/stats refresh */
+            SetTimer(hwnd, 2, 1500, NULL);  /* USB plug-in watcher */
             return 0;
         }
-        case WM_SIZE: {
-            int w = (int)(short)LOWORD(lp);
-            int h = (int)(short)HIWORD(lp);
-            if (w > 20 && h > 70) {
-                if (g_hStatus) MoveWindow(g_hStatus, 10, 8, w - 20, 18, TRUE);
-                if (g_hStats)  MoveWindow(g_hStats,  10, 28, w - 20, 18, TRUE);
-                if (g_hEdit)   MoveWindow(g_hEdit,   8, 50, w - 16, h - 58, TRUE);
+        case WM_SIZE:
+            LayoutControls((int)(short)LOWORD(lp), (int)(short)HIWORD(lp));
+            return 0;
+        case WM_COMMAND: {
+            int id = LOWORD(wp);
+            if (id == IDC_CONNECT || id == IDOK) {
+                StartBridgeFromUi();
+                return 0;
+            } else if (id == IDC_DISCONN) {
+                StopBridgeFromUi();
+                return 0;
+            } else if (id == IDC_SHOWPASS) {
+                int show = (SendMessageA(g_hChkShow, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                SendMessageA(g_hPassEdit, EM_SETPASSWORDCHAR, show ? 0 : (WPARAM)'*', 0);
+                InvalidateRect(g_hPassEdit, NULL, TRUE);
+                return 0;
+            } else if (id == IDC_TOTRAY) {
+                ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            } else if (id == IDC_BOOTWATCH) {
+                int en = (SendMessageA(g_hChkBoot, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                SetBootAutoStart(en);
+                return 0;
+            } else if (id == IDC_AUTOCONN) {
+                g_AutoConnect = (SendMessageA(g_hChkAuto, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                if (g_hSsidEdit) GetWindowTextA(g_hSsidEdit, g_TargetSsid, sizeof(g_TargetSsid));
+                if (g_hPassEdit) GetWindowTextA(g_hPassEdit, g_Password, sizeof(g_Password));
+                SaveWifiConfig();
+                return 0;
+            } else if (id == IDM_TRAY_OPEN) {
+                ShowAndFocusMainWindow();
+                return 0;
+            } else if (id == IDM_TRAY_EXIT) {
+                SendMessageA(hwnd, WM_CLOSE, 0, 0);
+                return 0;
+            }
+            break;
+        }
+        case WM_TRAYICON:
+            if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) {
+                if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
+                else ShowAndFocusMainWindow();
+            } else if (lp == WM_RBUTTONUP) {
+                HMENU hm = CreatePopupMenu();
+                if (hm) {
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    AppendMenuA(hm, MF_STRING, IDM_TRAY_OPEN, "Open RTL8822BU Wi-Fi Bridge");
+                    AppendMenuA(hm, MF_SEPARATOR, 0, NULL);
+                    AppendMenuA(hm, MF_STRING, IDM_TRAY_EXIT, "Exit");
+                    SetForegroundWindow(hwnd);
+                    TrackPopupMenu(hm, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+                    DestroyMenu(hm);
+                }
             }
             return 0;
-        }
+        case WM_DEVICECHANGE:
+            PollUsbPlugIn();
+            return 0;
         case WM_TIMER:
             if (wp == 1) UpdateGuiFromWorker();
+            else if (wp == 2) PollUsbPlugIn();
             return 0;
         case WM_CLOSE:
             g_Running = 0;
+            g_BridgeStop = 1;
             KillTimer(hwnd, 1);
+            KillTimer(hwnd, 2);
+            UpdateTrayIcon(W95_NIM_DELETE, NULL);
             SaveLog();
             DestroyWindow(hwnd);
             return 0;
@@ -2261,19 +2672,30 @@ static LRESULT CALLBACK BridgeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 void WinMainCRTStartup(void) {
+    /* Single-instance check: if already running in tray, just pop it up! */
+    HWND hPrev = FindWindowA("RTW88Win95Gui", NULL);
+    if (hPrev) {
+        ShowWindow(hPrev, SW_SHOWNORMAL);
+        ShowWindow(hPrev, SW_RESTORE);
+        SetForegroundWindow(hPrev);
+        ExitProcess(0);
+    }
+
     InitializeCriticalSection(&g_Lock);
     InitializeCriticalSection(&g_PrintLock);
     InitializeCriticalSection(&g_VxdLock);
     InitializeCriticalSection(&g_TxLock);
 
-    /* Keep NORMAL_PRIORITY_CLASS so Win95 USB/UI threads are never starved;
-     * native --subsystem,windows apps are never suspended in the background! */
+    LoadConfig();
 
     HINSTANCE hInst = GetModuleHandleA(NULL);
+    g_hAppIcon = LoadIconA(NULL, IDI_APPLICATION);
+
     WNDCLASSA wc;
     c_zero(&wc, sizeof(wc));
     wc.lpfnWndProc   = BridgeWndProc;
     wc.hInstance     = hInst;
+    wc.hIcon         = g_hAppIcon;
     wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = "RTW88Win95Gui";
@@ -2281,25 +2703,47 @@ void WinMainCRTStartup(void) {
 
     g_hWnd = CreateWindowExA(
         0, "RTW88Win95Gui", "RTL8822BU Win95 Wi-Fi Bridge",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 560, 380,
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 560, 420,
         NULL, NULL, hInst, NULL);
     if (!g_hWnd) ExitProcess(1);
 
-    ShowWindow(g_hWnd, SW_SHOWNORMAL);
-    UpdateWindow(g_hWnd);
+    UpdateTrayIcon(W95_NIM_ADD, "RTL8822BU Win95 Wi-Fi Bridge");
 
-    DWORD tid = 0;
-    /* Commit 256 KB stack upfront so worker thread never hits a 4 KB guard page */
-    CreateThread(NULL, 0x40000, BridgeWorkerThread, NULL, 0, &tid);
+    int dongleNow = ProbeUsbDongle();
+    g_DongleSeen = dongleNow;
+
+    if (g_StartInTray && !dongleNow) {
+        /* Booted into Tray with dongle unplugged: stay hidden until plugged in! */
+        SetStatus("Waiting for RTL8822BU USB Wi-Fi dongle (plug it in!)...");
+        UpdateTrayIcon(W95_NIM_MODIFY, "RTL8822BU Wi-Fi: Waiting for USB dongle");
+        ShowWindow(g_hWnd, SW_HIDE);
+    } else {
+        ShowWindow(g_hWnd, SW_SHOWNORMAL);
+        UpdateWindow(g_hWnd);
+        if (dongleNow) {
+            if ((g_CliConnect || g_AutoConnect) && g_TargetSsidLen > 0) {
+                StartBridgeFromUi();
+            } else {
+                SetStatus("USB Wi-Fi dongle ready! Enter Wi-Fi Name & Password and click Connect.");
+                if (g_hSsidEdit) SetFocus(g_hSsidEdit);
+            }
+        } else {
+            SetStatus("Waiting for RTL8822BU USB Wi-Fi dongle (plug it in!)...");
+        }
+    }
 
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        if (!IsDialogMessageA(g_hWnd, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
     }
 
     g_Running = 0;
+    g_BridgeStop = 1;
+    UpdateTrayIcon(W95_NIM_DELETE, NULL);
     SaveLog();
     ExitProcess(0);
 }
