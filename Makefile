@@ -11,7 +11,11 @@ JWLINK ?= /Users/ethan/.gemini/antigravity/brain/8dbb8657-600c-4d8e-9f0c-ae28412
 all: RTWPROBE.SYS RTWTEST.EXE AUTOBIND.EXE RTWSCAN.EXE RTWBRIDGE.EXE RTW88.VXD TESTVXD.VXD VXDDIAG.EXE PINGTEST.EXE
 
 RTWBRIDGE.EXE: rtwbridge.c wpa2_crypto.h rtw8822b_tables.h
-	$(CC) $(CFLAGS) -nostdlib -e _mainCRTStartup -Wl,--subsystem,console -o $@ rtwbridge.c -lkernel32 -luser32
+	$(CC) -O2 -march=pentium-mmx -mtune=pentium-mmx -mno-stack-arg-probe -nostdlib -Wall -Wextra \
+	  -o $@ rtwbridge.c -lkernel32 -luser32 -lgdi32 \
+	  -Wl,-e,_WinMainCRTStartup -Wl,--subsystem,windows \
+	  -Xlinker --stack -Xlinker 0x100000,0x40000 \
+	  -Wl,--disable-dynamicbase -Wl,--disable-nxcompat
 
 PINGTEST.EXE: pingtest.c
 	$(CC) $(CFLAGS) -nostdlib -e _mainCRTStartup -Wl,--subsystem,console -o $@ $< -lkernel32 -luser32
